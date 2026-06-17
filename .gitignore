@@ -1,0 +1,27 @@
+# Generated files — do not commit
+today.xlsx
+routes_output.xlsx
+customer_map.html
+
+# Historical data — large file, keep local only
+_setup/Za model.xlsx
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+
+# Environment
+.env
+.venv
+venv/
+
+# Streamlit local secrets (set via Streamlit Cloud dashboard instead)
+.streamlit/secrets.toml
+
+# OS files
+.DS_Store
+Thumbs.db
+desktop.ini

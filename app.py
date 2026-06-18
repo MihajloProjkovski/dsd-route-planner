@@ -1,10 +1,5 @@
-"""
+﻿"""
 app.py - DSD Route Planner Web Application
-Deployed on Streamlit Community Cloud.
-
-Pages:
-  Route Planning  - upload today.xlsx, select mode, generate routes, download output
-  Admin           - password-protected: customer master, new customer, fleet/zones, config
 """
 
 import io
@@ -13,8 +8,10 @@ import sys
 from datetime import date
 
 import openpyxl
+from openpyxl.styles import PatternFill, Font, Alignment
 import pandas as pd
 import streamlit as st
+import streamlit.components.v1 as components
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
 if ROOT not in sys.path:
@@ -22,7 +19,6 @@ if ROOT not in sys.path:
 
 import config
 import route_planner as rp
-import suggest_zones as sz
 
 st.set_page_config(
     page_title="DSD Route Planner",
@@ -35,7 +31,9 @@ st.markdown("""
 <style>
   .block-container { padding-top: 1.2rem; }
   .stButton > button { border-radius: 6px; }
-  div[data-testid="metric-container"] { background: #f8f9fa; border-radius: 8px; padding: 8px; }
+  div[data-testid="metric-container"] {
+    background: #f8f9fa; border-radius: 8px; padding: 8px;
+  }
 </style>
 """, unsafe_allow_html=True)
 
@@ -48,64 +46,75 @@ page = st.sidebar.radio(
     label_visibility="collapsed",
 )
 st.sidebar.markdown("---")
-st.sidebar.caption("v1.0 · Skopje DSD")
+st.sidebar.caption("v2.0 · Skopje DSD")
 
 
-def ensure_today_xlsx():
-    if not os.path.exists(config.TODAY_FILE):
-        from openpyxl.styles import PatternFill, Font, Alignment
-        type_fills = {
-            "Kamion": PatternFill("solid", fgColor="D6E4F7"),
-            "Furgon": PatternFill("solid", fgColor="D6F7E4"),
-            "Van":    PatternFill("solid", fgColor="FFF3CD"),
-        }
-        HDR_FILL = PatternFill("solid", fgColor="1F4E79")
-        HDR_FONT = Font(color="FFFFFF", bold=True)
-        wb = openpyxl.Workbook()
+def make_blank_template() -> bytes:
+    HDR_FILL = PatternFill("solid", fgColor="1F4E79")
+    HDR_FONT = Font(color="FFFFFF", bold=True)
+    wb = openpyxl.Workbook()
+    ws_o = wb.active
+    ws_o.title = "Orders"
+    ws_o.append(["customer_code", "customer_name", "cases", "kg"])
+    for cell in ws_o[1]:
+        cell.fill = HDR_FILL; cell.font = HDR_FONT
+        cell.alignment = Alignment(horizontal="center")
+    for col, w in zip(["A","B","C","D"], [18, 35, 10, 12]):
+        ws_o.column_dimensions[col].width = w
+    ws_o.freeze_panes = "A2"
 
-        ws_ord = wb.active
-        ws_ord.title = "Orders"
-        ws_ord.append(["customer_code", "customer_name", "cases", "kg"])
-        for cell in ws_ord[1]:
-            cell.fill = HDR_FILL
-            cell.font = HDR_FONT
-            cell.alignment = Alignment(horizontal="center")
+    ws_v = wb.create_sheet("Vehicles")
+    headers = ["vehicle_name", "vehicle_type", "capacity_kg",
+               "zone", "available", "max_trips_per_day", "notes"]
+    ws_v.append(headers)
+    for cell in ws_v[1]:
+        cell.fill = HDR_FILL; cell.font = HDR_FONT
+        cell.alignment = Alignment(horizontal="center")
+    for col_letter, w in zip(["A","B","C","D","E","F","G"], [20,12,14,22,12,18,25]):
+        ws_v.column_dimensions[col_letter].width = w
+    ws_v.append([])
+    ws_v.append(["HOW TO FILL:"])
+    ws_v.append(["vehicle_name    -> Your vehicle name/plate (e.g. DSD 1, F 3, Van 7)"])
+    ws_v.append(["vehicle_type    -> Kamion | Furgon | Van"])
+    ws_v.append(["capacity_kg     -> Usable kg per trip (e.g. 6000, 5200, 3200)"])
+    ws_v.append(["zone            -> Same as vehicle_name for dedicated zone. Float for overflow."])
+    ws_v.append(["available       -> TRUE = working today, FALSE = unavailable"])
+    ws_v.append(["max_trips       -> 2 = normal day, 3 = heavy day"])
+    ws_v.freeze_panes = "A2"
 
-        ws_veh = wb.create_sheet("Vehicles")
-        ws_veh.append(["vehicle_name", "vehicle_type", "zone",
-                        "available", "max_trips_per_day", "notes"])
-        for cell in ws_veh[1]:
-            cell.fill = HDR_FILL
-            cell.font = HDR_FONT
-            cell.alignment = Alignment(horizontal="center")
-        for v in config.FLEET:
-            ws_veh.append([v["name"], v["type"], "", True, config.MAX_TRIPS_NORMAL, ""])
-            fill = type_fills.get(v["type"])
-            if fill:
-                for cell in ws_veh[ws_veh.max_row]:
-                    cell.fill = fill
-
-        wb.save(config.TODAY_FILE)
+    buf = io.BytesIO()
+    wb.save(buf)
+    buf.seek(0)
+    return buf.getvalue()
 
 
 def run_routing(file_bytes: bytes, mode: str):
     with open(config.TODAY_FILE, "wb") as f:
         f.write(file_bytes)
-
     stops_df    = rp.load_orders(config.TODAY_FILE, config.CUSTOMER_MASTER)
     vehicles_df = rp.load_vehicles(config.TODAY_FILE)
-
+    zone_affinity = (mode == "smart")
+    routes, unassigned, stops_df = rp.solve(stops_df, vehicles_df, zone_affinity=zone_affinity)
     zone_summary = None
-    if mode == "territory":
-        routes, unassigned, zone_summary = rp.solve_territory(stops_df, vehicles_df)
-    else:
-        routes, unassigned, stops_df = rp.solve(stops_df, vehicles_df)
-
-    buf = io.BytesIO()
-    rp.write_excel(routes, stops_df, unassigned, buf, zone_summary)
-    buf.seek(0)
-
-    return buf.getvalue(), routes, stops_df, unassigned, zone_summary
+    if zone_affinity:
+        vehicle_zones = {}
+        for _, row in vehicles_df.iterrows():
+            z = str(row["zone"]).strip()
+            if z.lower() not in ("", "nan", "float", "none"):
+                vehicle_zones[row["vehicle_name"]] = z
+        original_counts = {}
+        for _, row in stops_df.iterrows():
+            sz = str(row.get("zone", "")).strip()
+            for vname, vzone in vehicle_zones.items():
+                if vzone == sz:
+                    original_counts[vname] = original_counts.get(vname, 0) + 1
+                    break
+        zone_summary = rp.build_zone_summary_from_routes(routes, original_counts)
+    excel_buf = io.BytesIO()
+    rp.write_excel(routes, stops_df, unassigned, excel_buf, zone_summary)
+    excel_buf.seek(0)
+    map_html = rp.generate_route_map(routes) if routes else None
+    return excel_buf.getvalue(), routes, stops_df, unassigned, zone_summary, map_html
 
 
 def check_zones_assigned(file_bytes: bytes) -> bool:
@@ -120,134 +129,107 @@ def check_zones_assigned(file_bytes: bytes) -> bool:
         return False
 
 
-# ── Page: Route Planning ──────────────────────────────────────────────────────
 if page == "🗺 Route Planning":
     st.header("Route Planning")
-
     col_up, col_mode = st.columns([3, 1])
-
     with col_up:
         uploaded = st.file_uploader(
-            "Upload **today.xlsx** (fill Orders sheet + check Vehicles sheet)",
+            "Upload **today.xlsx** (Orders + Vehicles sheets)",
             type=["xlsx"],
-            help="The file must have an 'Orders' sheet and a 'Vehicles' sheet.",
+            help="Need a blank template? Admin → Fleet & Zones → Download blank template.",
         )
-
     with col_mode:
-        st.markdown("**Routing Mode**")
-        mode = st.radio(
-            "mode",
-            ["Territory", "Optimise"],
-            label_visibility="collapsed",
+        st.markdown("**Mode**")
+        mode_label = st.radio(
+            "mode", ["🧠 SMART", "🔓 FREE"], label_visibility="collapsed",
             help=(
-                "**Territory** — each vehicle serves its own zone. "
-                "Load is rebalanced automatically. Best for normal and heavy days.\n\n"
-                "**Optimise** — solver assigns stops freely. Best for light days."
+                "**SMART** — Zone-aware. Each vehicle biased to its own customers "
+                "but solver can reassign for efficiency. Daily use.\n\n"
+                "**FREE** — No zone bias. Pure distance. Use as benchmark or backup."
             ),
         )
+        mode = "smart" if "SMART" in mode_label else "free"
 
     if uploaded:
         file_bytes = uploaded.getvalue()
-
         try:
-            prev = pd.read_excel(io.BytesIO(file_bytes), sheet_name="Orders")
-            prev = prev.dropna(how="all")
-            st.caption(f"📦 **{len(prev)}** orders detected in uploaded file")
+            prev = pd.read_excel(io.BytesIO(file_bytes), sheet_name="Orders").dropna(how="all")
+            st.caption(f"📦 **{len(prev)}** orders detected")
         except Exception:
             pass
-
-        if mode == "Territory" and not check_zones_assigned(file_bytes):
-            st.warning(
-                "⚠️ No zone assignments found in the Vehicles sheet. "
-                "Go to **Admin → Fleet & Zones** to generate zone suggestions, "
-                "or switch to **Optimise** mode."
-            )
+        if mode == "smart" and not check_zones_assigned(file_bytes):
+            st.warning("⚠️ No zone assignments found in Vehicles sheet. "
+                       "Switch to FREE mode or set zones in the Vehicles sheet.")
 
         if st.button("▶  Generate Routes", type="primary"):
-            with st.spinner(
-                f"Running {mode} routing... "
-                f"{'(instant)' if mode == 'Territory' else '(up to 2 min for Optimise)'}"
-            ):
+            with st.spinner(f"Running {'SMART' if mode=='smart' else 'FREE'} routing "
+                            f"(up to {config.SOLVER_TIME_LIMIT_SECONDS//60} min)…"):
                 try:
-                    excel_bytes, routes, stops_df, unassigned, zone_summary = \
-                        run_routing(file_bytes, mode.lower())
-
+                    excel_bytes, routes, stops_df, unassigned, zone_summary, map_html = \
+                        run_routing(file_bytes, mode)
                     st.session_state.update({
-                        "excel_bytes":  excel_bytes,
-                        "routes":       routes,
-                        "stops_count":  len(stops_df),
-                        "unassigned":   unassigned,
-                        "zone_summary": zone_summary,
-                        "mode":         mode,
+                        "excel_bytes": excel_bytes, "routes": routes,
+                        "stops_count": len(stops_df), "unassigned": unassigned,
+                        "zone_summary": zone_summary, "map_html": map_html,
                     })
                 except SystemExit as e:
                     st.error(f"❌ {e}")
 
     if "excel_bytes" in st.session_state:
-        vehs    = len(st.session_state["routes"])
-        stops   = st.session_state["stops_count"]
-        skipped = len(st.session_state.get("unassigned", []))
-
         c1, c2, c3 = st.columns(3)
-        c1.metric("Vehicles Routed", vehs)
-        c2.metric("Stops Assigned",  stops)
-        c3.metric("Unassigned",       skipped,
-                  delta=f"-{skipped}" if skipped else None,
-                  delta_color="inverse")
+        c1.metric("Vehicles Routed", len(st.session_state["routes"]))
+        c2.metric("Stops Assigned",  st.session_state["stops_count"])
+        skipped = len(st.session_state.get("unassigned", []))
+        c3.metric("Unassigned", skipped,
+                  delta=f"-{skipped}" if skipped else None, delta_color="inverse")
 
-        st.download_button(
-            "⬇  Download routes_output.xlsx",
-            st.session_state["excel_bytes"],
-            file_name="routes_output.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            type="primary",
-        )
+        d1, d2 = st.columns(2)
+        with d1:
+            st.download_button("⬇  Download routes_output.xlsx",
+                               st.session_state["excel_bytes"],
+                               file_name="routes_output.xlsx",
+                               mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                               type="primary", use_container_width=True)
+        with d2:
+            if st.session_state.get("map_html"):
+                st.download_button("🗺  Download Route Map (HTML)",
+                                   st.session_state["map_html"].encode("utf-8"),
+                                   file_name="route_map.html", mime="text/html",
+                                   use_container_width=True)
 
         if skipped:
-            st.warning(
-                f"⚠️ **{skipped}** stop(s) could not be assigned. "
-                "Check the **Unassigned** sheet in the downloaded file."
-            )
+            st.warning(f"⚠️ **{skipped}** stop(s) unassigned — see Unassigned sheet.")
+
+        if st.session_state.get("map_html"):
+            st.markdown("---")
+            st.subheader("Interactive Route Map")
+            st.caption("Filter by vehicle type, vehicle name, or trip number in the map sidebar.")
+            components.html(st.session_state["map_html"], height=540, scrolling=False)
 
         zs = st.session_state.get("zone_summary")
         if zs:
             st.markdown("---")
-            st.subheader("Zone Load — After Rebalancing")
-            df_zs = pd.DataFrame(zs)[
-                ["vehicle", "zone", "orig_stops", "stops", "kg", "status"]
-            ].copy()
-            df_zs.columns = ["Vehicle", "Zone", "Original", "Final", "KG", "Status"]
-
+            st.subheader("Zone Load Summary")
+            df_zs = pd.DataFrame(zs)[["vehicle","zone","orig_stops","stops","kg","status"]].copy()
+            df_zs.columns = ["Vehicle","Zone","Original","Final","KG","Status"]
             def _color(row):
-                c = {
-                    "OVERLOADED": "background-color:#FFDDC1",
-                    "LIGHT":      "background-color:#FFFACD",
-                    "NO ORDERS":  "background-color:#E8E8E8",
-                }.get(row["Status"], "")
-                return [c] * len(row)
-
-            st.dataframe(
-                df_zs.style.apply(_color, axis=1),
-                use_container_width=True,
-                hide_index=True,
-                height=420,
-            )
+                c = {"OVERLOADED":"background-color:#FFDDC1","LIGHT":"background-color:#FFFACD",
+                     "NO ORDERS":"background-color:#E8E8E8"}.get(row["Status"],"")
+                return [c]*len(row)
+            st.dataframe(df_zs.style.apply(_color, axis=1),
+                         use_container_width=True, hide_index=True, height=380)
 
 
-# ── Page: Admin ───────────────────────────────────────────────────────────────
 elif page == "⚙️ Admin":
     st.header("Admin Panel")
-
-    # Authentication - use secrets if available, fallback to default for local dev
     try:
         admin_pw = st.secrets["admin_password"]
     except Exception:
-        admin_pw = "dsd2024"  # local dev fallback - override via Streamlit Cloud secrets
+        admin_pw = "dsd2024"
 
     if not st.session_state.get("admin_auth"):
         with st.form("login_form"):
-            pw = st.text_input("Password", type="password",
-                               placeholder="Enter admin password")
+            pw = st.text_input("Password", type="password")
             if st.form_submit_button("Login", type="primary"):
                 if pw == admin_pw:
                     st.session_state["admin_auth"] = True
@@ -256,230 +238,131 @@ elif page == "⚙️ Admin":
                     st.error("Incorrect password.")
         st.stop()
 
-    col_status, col_logout = st.columns([5, 1])
-    col_status.success("✅ Logged in as Admin")
-    if col_logout.button("Logout"):
+    col_s, col_l = st.columns([5, 1])
+    col_s.success("✅ Logged in as Admin")
+    if col_l.button("Logout"):
         st.session_state["admin_auth"] = False
         st.rerun()
-
     st.markdown("---")
 
     tab_master, tab_customer, tab_fleet, tab_cfg = st.tabs([
-        "📋 Customer Master",
-        "➕ New Customer",
-        "🚛 Fleet & Zones",
-        "⚙️ Configuration",
-    ])
+        "📋 Customer Master", "➕ New Customer", "🚛 Fleet & Zones", "⚙️ Configuration"])
 
     with tab_master:
         st.subheader("Customer Master")
         mp = config.CUSTOMER_MASTER
-
         if os.path.exists(mp):
             mdf = pd.read_excel(mp, sheet_name="Customers")
-            c1, c2, c3 = st.columns(3)
-            c1.metric("Total Customers", len(mdf))
-            c2.metric("Zones",           mdf["zone"].nunique())
-            c3.metric("With History",    int((mdf["visits"] > 0).sum()))
-
-            st.markdown("**Zone Distribution**")
-            zd = (
-                mdf.groupby("zone")
-                .agg(
-                    customers        =("customer_code", "count"),
-                    dominant_vehicle =("preferred_vehicle",
-                                       lambda x: x.value_counts().index[0]),
-                    avg_kg           =("avg_weight_kg", "mean"),
-                )
-                .round(1)
-                .reset_index()
-            )
-            st.dataframe(zd, use_container_width=True, hide_index=True, height=320)
+            c1,c2,c3 = st.columns(3)
+            c1.metric("Customers", len(mdf))
+            c2.metric("Zones", mdf["zone"].nunique())
+            c3.metric("With History", int((mdf["visits"]>0).sum()))
+            zd = (mdf.groupby("zone").agg(
+                customers=("customer_code","count"),
+                dominant=("preferred_vehicle", lambda x: x.value_counts().index[0]),
+                avg_kg=("avg_weight_kg","mean")).round(1).reset_index())
+            st.dataframe(zd, use_container_width=True, hide_index=True, height=300)
         else:
-            st.warning("customer_master.xlsx not found. Run _setup/run_setup.bat locally first.")
-
+            st.warning("customer_master.xlsx not found.")
         st.markdown("---")
         cu, cd = st.columns(2)
-
         with cu:
-            st.markdown("**Replace Customer Master**")
-            new_m = st.file_uploader("Upload new customer_master.xlsx",
-                                     type=["xlsx"], key="master_up")
-            if new_m and st.button("✅ Replace Master", type="primary"):
+            st.markdown("**Upload New Master**")
+            new_m = st.file_uploader("Upload customer_master.xlsx", type=["xlsx"], key="master_up")
+            if new_m and st.button("✅ Replace", type="primary"):
                 os.makedirs(os.path.dirname(mp), exist_ok=True)
-                with open(mp, "wb") as f:
-                    f.write(new_m.getvalue())
+                with open(mp, "wb") as f: f.write(new_m.getvalue())
                 st.success("Customer master replaced.")
                 st.rerun()
-
         with cd:
             st.markdown("**Download Current Master**")
             if os.path.exists(mp):
                 with open(mp, "rb") as f:
-                    st.download_button("⬇ Download customer_master.xlsx",
-                                       f.read(), "customer_master.xlsx",
+                    st.download_button("⬇ Download", f.read(), "customer_master.xlsx",
                                        use_container_width=True)
 
     with tab_customer:
         st.subheader("Add New Customer")
         mp2 = config.CUSTOMER_MASTER
-
         if not os.path.exists(mp2):
             st.error("Customer master not found.")
         else:
             mdf2 = pd.read_excel(mp2, sheet_name="Customers")
             mdf2["customer_code"] = mdf2["customer_code"].astype(str)
             zones_list = sorted(mdf2["zone"].dropna().unique().tolist())
-
             with st.form("new_cust_form"):
                 col1, col2 = st.columns(2)
                 with col1:
-                    code   = st.text_input("Customer Code *")
-                    name   = st.text_input("Customer Name *")
-                    street = st.text_input("Street / Address")
-                    lat    = st.number_input("Latitude *",  value=42.005,
-                                             format="%.6f", step=0.0001)
-                    lon    = st.number_input("Longitude *", value=21.435,
-                                             format="%.6f", step=0.0001)
+                    code=st.text_input("Customer Code *"); name=st.text_input("Customer Name *")
+                    street=st.text_input("Street")
+                    lat=st.number_input("Latitude *", value=42.005, format="%.6f", step=0.0001)
+                    lon=st.number_input("Longitude *", value=21.435, format="%.6f", step=0.0001)
                 with col2:
-                    zone     = st.selectbox("Zone *", zones_list)
-                    pref     = st.selectbox("Preferred Vehicle",
-                                            ["Kamion", "Furgon", "Van"])
-                    eligible = st.multiselect("Eligible Vehicles *",
-                                              ["Kamion", "Furgon", "Van"],
-                                              default=[pref])
-                    tw_s = st.text_input("Time Window Start", "06:00")
-                    tw_e = st.text_input("Time Window End",   "18:00")
-
+                    zone=st.selectbox("Zone (= vehicle name) *", zones_list)
+                    pref=st.selectbox("Preferred Vehicle", ["Kamion","Furgon","Van"])
+                    eligible=st.multiselect("Eligible Vehicles *", ["Kamion","Furgon","Van"], default=[pref])
+                    tw_s=st.text_input("TW Start","06:00"); tw_e=st.text_input("TW End","18:00")
                 if st.form_submit_button("Add Customer", type="primary"):
                     if not code or not name or not eligible:
-                        st.error("Please fill all required fields (*).")
+                        st.error("Fill all required fields.")
                     elif code in mdf2["customer_code"].values:
-                        st.error(f"Code **{code}** already exists in the master.")
+                        st.error(f"Code {code} already exists.")
                     else:
-                        wb_m  = openpyxl.load_workbook(mp2)
-                        ws_m  = wb_m["Customers"]
-                        cols  = [c.value for c in ws_m[1]]
-                        nrow  = {
-                            "customer_code":     code,
-                            "customer_name":     name,
-                            "street":            street,
-                            "latitude":          lat,
-                            "longitude":         lon,
-                            "zone":              zone,
-                            "special_zone":      "",
-                            "eligible_vehicles": ",".join(eligible),
-                            "preferred_vehicle": pref,
-                            "time_window_start": tw_s,
-                            "time_window_end":   tw_e,
-                            "visits":            0,
-                            "avg_weight_kg":     0,
-                            "avg_cases":         0,
-                            "kg_per_case":       0,
-                            "vehicle_breakdown": "New customer - no history",
-                            "notes":             "Added via web admin",
-                        }
-                        ws_m.append([nrow.get(c, "") for c in cols])
+                        wb_m=openpyxl.load_workbook(mp2); ws_m=wb_m["Customers"]
+                        cols=[c.value for c in ws_m[1]]
+                        nrow={"customer_code":code,"customer_name":name,"street":street,
+                              "latitude":lat,"longitude":lon,"zone":zone,"special_zone":"",
+                              "eligible_vehicles":",".join(eligible),"preferred_vehicle":pref,
+                              "time_window_start":tw_s,"time_window_end":tw_e,
+                              "visits":0,"avg_weight_kg":0,"avg_cases":0,"kg_per_case":0,
+                              "vehicle_breakdown":"New customer","notes":"Added via web admin"}
+                        ws_m.append([nrow.get(c,"") for c in cols])
                         wb_m.save(mp2)
-                        st.success(f"✅ **{name}** ({code}) added to zone **{zone}**.")
+                        st.success(f"✅ {name} ({code}) added to zone {zone}.")
 
     with tab_fleet:
-        st.subheader("Fleet & Zone Assignments")
-
-        c1, c2, c3 = st.columns(3)
-        c1.metric("Kamion", sum(1 for v in config.FLEET if v["type"] == "Kamion"))
-        c2.metric("Furgon", sum(1 for v in config.FLEET if v["type"] == "Furgon"))
-        c3.metric("Van",    sum(1 for v in config.FLEET if v["type"] == "Van"))
-
+        st.subheader("Fleet & Zones")
+        st.markdown("#### Blank today.xlsx Template")
+        st.markdown("Download, fill in your vehicles once, then use daily.")
+        st.download_button("⬇  Download blank today.xlsx",
+                           make_blank_template(), file_name="today.xlsx",
+                           mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                           type="primary")
         st.markdown("---")
-        st.subheader("Zone Suggestion")
-        st.markdown(
-            "Click **Generate** to create a `today.xlsx` with zone assignments "
-            "pre-filled for all 44 vehicles. Download, review in Excel if needed, "
-            "then upload it on the Route Planning page."
-        )
+        st.markdown("""**Vehicles sheet columns:**
 
-        if st.button("⚙️ Generate today.xlsx with Zone Suggestions", type="primary"):
-            ensure_today_xlsx()
-            try:
-                import contextlib
-                _buf = io.StringIO()
-                with contextlib.redirect_stdout(_buf):
-                    sz.suggest_assignments()
-                with open(config.TODAY_FILE, "rb") as f:
-                    st.session_state["zone_today_bytes"] = f.read()
-                st.success("✅ Zone suggestions generated - download below.")
-            except SystemExit as e:
-                st.error(str(e))
-            except Exception as e:
-                st.error(f"Error: {e}")
-
-        if st.session_state.get("zone_today_bytes"):
-            st.download_button(
-                "⬇ Download today.xlsx (zones pre-filled)",
-                st.session_state["zone_today_bytes"],
-                file_name="today.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            )
-
-        st.markdown("---")
-
-        if os.path.exists(config.TODAY_FILE):
-            try:
-                xl  = pd.ExcelFile(config.TODAY_FILE)
-                if "Vehicles" in xl.sheet_names:
-                    vdf = xl.parse("Vehicles").dropna(subset=["vehicle_name"])
-                    vdf = vdf[vdf["vehicle_name"].astype(str).str.len() > 2]
-                    vdf = vdf[["vehicle_name", "vehicle_type", "zone",
-                                "available", "max_trips_per_day"]]
-                    vdf.columns = ["Vehicle", "Type", "Zone", "Available", "Max Trips"]
-                    st.markdown("**Current today.xlsx Vehicle Sheet**")
-                    st.dataframe(vdf, use_container_width=True,
-                                 hide_index=True, height=320)
-            except Exception:
-                pass
+| Column | Description |
+|---|---|
+| `vehicle_name` | Name/plate — e.g. `DSD 1`, `F 3`, `Van 7` |
+| `vehicle_type` | `Kamion`, `Furgon`, or `Van` |
+| `capacity_kg` | Usable load per trip in kg |
+| `zone` | Same as `vehicle_name` for dedicated zone. `Float` for overflow. |
+| `available` | `TRUE` = working today |
+| `max_trips_per_day` | `2` normal, `3` heavy |
+""")
+        if os.path.exists(config.CUSTOMER_MASTER):
+            st.markdown("**Zone Summary from Customer Master**")
+            mdf3 = pd.read_excel(config.CUSTOMER_MASTER, sheet_name="Zone Summary")
+            st.dataframe(mdf3, use_container_width=True, hide_index=True, height=260)
 
     with tab_cfg:
-        st.subheader("Current Configuration")
-        st.info(
-            "Configuration is managed in **config.py**. "
-            "Edit and push to GitHub - changes apply on the next app load."
-        )
-
+        st.subheader("Configuration")
+        st.info("Edit **config.py** and push to GitHub to apply changes.")
         c1, c2 = st.columns(2)
         with c1:
             st.markdown("**Depot**")
-            st.code(
-                f"Latitude:    {config.DEPOT_LAT}\n"
-                f"Longitude:   {config.DEPOT_LON}\n"
-                f"Open:        {config.DEPOT_OPEN}\n"
-                f"Close:       {config.DEPOT_CLOSE}"
-            )
-            st.markdown("**Trip Capacities**")
-            for vtype, cap in config.TRIP_CAPACITY.items():
-                st.text(f"  {vtype}: {cap:,} kg")
-
+            st.code(f"Lat: {config.DEPOT_LAT}  Lon: {config.DEPOT_LON}\n"
+                    f"Open: {config.DEPOT_OPEN}  Close: {config.DEPOT_CLOSE}")
+            st.markdown("**Capacity Defaults**")
+            for vt, cap in config.TRIP_CAPACITY.items():
+                st.text(f"  {vt}: {cap:,} kg/trip")
         with c2:
-            st.markdown("**Routing**")
-            st.code(
-                f"Max stops/day:    {config.MAX_STOPS_PER_DAY}\n"
-                f"Max trips (norm): {config.MAX_TRIPS_NORMAL}\n"
-                f"Max trips (peak): {config.MAX_TRIPS_PEAK}\n"
-                f"Driver hours:     {config.MAX_DRIVER_HOURS}\n"
-                f"Solver time:      {config.SOLVER_TIME_LIMIT_SECONDS} s\n"
-                f"Avg speed:        {config.AVERAGE_SPEED_KMH} km/h"
-            )
+            st.markdown("**Solver**")
+            st.code(f"Max stops/day : {config.MAX_STOPS_PER_DAY}\n"
+                    f"Solver time   : {config.SOLVER_TIME_LIMIT_SECONDS} s\n"
+                    f"Zone penalty  : {config.ZONE_AFFINITY_PENALTY_KM} km\n"
+                    f"Avg speed     : {config.AVERAGE_SPEED_KMH} km/h")
             st.markdown("**Special Zones**")
-            for zname, zdef in config.SPECIAL_ZONES.items():
-                st.text(
-                    f"  {zname}: {zdef['primary_vehicle']}  "
-                    f"{zdef['time_window_start']}-{zdef['time_window_end']}"
-                )
-
-        st.markdown("---")
-        st.markdown("**Territory Cluster Counts**")
-        for vtype, n in config.N_CLUSTERS_TERRITORY_PER_TYPE.items():
-            st.text(f"  {vtype}: {n} zones")
-        st.text(f"  + {len(config.SPECIAL_ZONES)} special zones")
-        total = sum(config.N_CLUSTERS_TERRITORY_PER_TYPE.values()) + len(config.SPECIAL_ZONES)
-        st.text(f"  = {total} total zones (matches fleet of {len(config.FLEET)} vehicles)")
+            for zn, zd in config.SPECIAL_ZONES.items():
+                st.text(f"  {zn}: {zd['primary_vehicle']}  "
+                        f"{zd['time_window_start']}–{zd['time_window_end']}")

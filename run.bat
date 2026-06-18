@@ -27,13 +27,16 @@ echo ============================================================
 echo   DSD Route Planner
 echo ============================================================
 echo.
-echo   1  -  OPTIMISE mode
-echo          Best for light days. Solver assigns stops freely
-echo          across all vehicles for maximum efficiency.
+echo   1  -  SMART mode  [recommended for daily use]
+echo          Zone-aware solver. Each vehicle is biased toward
+echo          its own customers but the solver can reassign
+echo          stops across zones for maximum efficiency.
+echo          Vehicles with no zone (Float) serve as overflow.
 echo.
-echo   2  -  TERRITORY mode
-echo          Best for normal and heavy days. Each vehicle serves
-echo          its own zone. Overflow redistributed automatically.
+echo   2  -  FREE mode  [diagnostic / backup]
+echo          No zone preferences. Solver assigns stops to any
+echo          vehicle purely by distance. Use when many vehicles
+echo          are unavailable or to benchmark SMART routes.
 echo.
 echo ============================================================
 echo.
@@ -41,14 +44,14 @@ set /p MODE="Select mode (1 or 2): "
 
 if "%MODE%"=="1" (
     echo.
-    echo Running OPTIMISE mode...
-    echo.
-    python route_planner.py optimise
-) else if "%MODE%"=="2" (
-    echo.
-    echo Running TERRITORY mode...
+    echo Running SMART mode...
     echo.
     python route_planner.py territory
+) else if "%MODE%"=="2" (
+    echo.
+    echo Running FREE mode...
+    echo.
+    python route_planner.py optimise
 ) else (
     echo.
     echo Invalid selection. Please enter 1 or 2.

@@ -65,6 +65,25 @@ def build_matrices(locations):
     return dist_m.tolist(), time_m.tolist()
 
 
+def load_zone_centres(master_path):
+    """Load median lat/lon per zone from customer master.
+    Used as geographic anchors for zone affinity in territory mode."""
+    if not os.path.exists(master_path):
+        return {}
+    try:
+        mdf = pd.read_excel(master_path, sheet_name="Customers")
+        mdf.columns = mdf.columns.str.strip().str.lower().str.replace(" ", "_")
+        mdf["latitude"]  = pd.to_numeric(mdf["latitude"],  errors="coerce")
+        mdf["longitude"] = pd.to_numeric(mdf["longitude"], errors="coerce")
+        mdf = mdf.dropna(subset=["latitude", "longitude", "zone"])
+        centres = {}
+        for zone, grp in mdf.groupby("zone"):
+            centres[str(zone)] = (grp["latitude"].median(), grp["longitude"].median())
+        return centres
+    except Exception:
+        return {}
+
+
 def load_orders(today_path, master_path):
     if not os.path.exists(today_path):
         sys.exit(f"\nERROR: '{today_path}' not found.\n  Fill the Orders sheet and save.")
@@ -138,7 +157,8 @@ def load_vehicles(today_path):
         sys.exit("ERROR: today.xlsx is missing the 'Vehicles' sheet.")
 
     veh = xl.parse("Vehicles")
-    veh = veh[veh.columns[:6]]
+    # Accept both old (6-col) and new (7-col with capacity_kg) sheet layouts
+    veh = veh[veh.columns[:7]]
     veh.columns = veh.columns.str.strip().str.lower().str.replace(" ", "_")
     veh = veh.dropna(subset=["vehicle_name"])
     veh["vehicle_name"] = veh["vehicle_name"].astype(str).str.strip()
@@ -154,13 +174,22 @@ def load_vehicles(today_path):
     veh["available"]         = veh["available"].apply(parse_bool)
     veh["max_trips_per_day"] = pd.to_numeric(veh.get("max_trips_per_day", 2), errors="coerce").fillna(config.MAX_TRIPS_NORMAL).astype(int)
 
+    # Per-vehicle capacity: use column if present, else fall back to type default
+    def resolve_capacity(row):
+        cap_col = pd.to_numeric(row.get("capacity_kg", None), errors="coerce")
+        if pd.notna(cap_col) and cap_col > 0:
+            return int(cap_col)
+        return config.TRIP_CAPACITY.get(str(row.get("vehicle_type", "Van")), 3_200)
+
+    veh["capacity_kg"] = veh.apply(resolve_capacity, axis=1)
+
     available = veh[veh["available"]].reset_index(drop=True)
     if available.empty:
         sys.exit("ERROR: No vehicles are marked as available in today.xlsx Vehicles sheet.")
     return available
 
 
-def solve(stops_df, vehicles_df):
+def solve(stops_df, vehicles_df, zone_affinity=False):
     depot     = (config.DEPOT_LAT, config.DEPOT_LON)
     stop_locs = list(zip(stops_df["latitude"], stops_df["longitude"]))
     locations = [depot] + stop_locs
@@ -168,8 +197,9 @@ def solve(stops_df, vehicles_df):
 
     veh_list = []
     for _, row in vehicles_df.iterrows():
-        vtype    = row["vehicle_type"]
-        trip_cap = config.TRIP_CAPACITY.get(vtype, 3_200)
+        vtype     = row["vehicle_type"]
+        # Use per-vehicle capacity if set, else fall back to type default
+        trip_cap  = int(row.get("capacity_kg", 0) or 0) or config.TRIP_CAPACITY.get(vtype, 3_200)
         max_trips = int(row["max_trips_per_day"])
         veh_list.append({
             "name":      row["vehicle_name"],
@@ -234,7 +264,37 @@ def solve(stops_df, vehicles_df):
         return dist_matrix[manager.IndexToNode(from_idx)][manager.IndexToNode(to_idx)]
 
     dist_cb_idx = routing.RegisterTransitCallback(dist_cb)
-    routing.SetArcCostEvaluatorOfAllVehicles(dist_cb_idx)
+
+    if zone_affinity:
+        # ── Per-vehicle arc costs with zone affinity penalty ──────────────────
+        # Stops assigned to a vehicle outside its zone pay a distance penalty
+        # equivalent to ZONE_AFFINITY_PENALTY_KM. This strongly discourages
+        # cross-zone assignments but allows them when routing math demands it.
+        penalty_m = int(config.ZONE_AFFINITY_PENALTY_KM * 1_000)
+        stop_zones = [str(stops_df.iloc[i].get("zone", "")) for i in range(len(stops_df))]
+
+        for v_idx, vehicle in enumerate(veh_list):
+            vzone    = str(vehicle["zone"]).strip()
+            is_float = vzone.lower() in ("float", "none", "", "nan")
+
+            if is_float:
+                # Float vehicles: no zone preference, use standard distance
+                routing.SetArcCostEvaluatorOfVehicle(dist_cb_idx, v_idx)
+            else:
+                def make_zone_cb(v_zone):
+                    def cb(from_idx, to_idx):
+                        i = manager.IndexToNode(from_idx)
+                        j = manager.IndexToNode(to_idx)
+                        d = dist_matrix[i][j]
+                        if 0 < j <= len(stop_zones):
+                            if stop_zones[j - 1] != v_zone:
+                                d += penalty_m
+                        return d
+                    return cb
+                cb_idx = routing.RegisterTransitCallback(make_zone_cb(vzone))
+                routing.SetArcCostEvaluatorOfVehicle(cb_idx, v_idx)
+    else:
+        routing.SetArcCostEvaluatorOfAllVehicles(dist_cb_idx)
 
     def time_cb(from_idx, to_idx):
         i = manager.IndexToNode(from_idx)
@@ -414,25 +474,36 @@ def solve_territory(stops_df, vehicles_df):
     min_stops = 4
     depot     = (config.DEPOT_LAT, config.DEPOT_LON)
 
+    # Dedicated zone vehicles
     zone_to_veh = {}
+    # Float vehicles (no fixed zone — serve as overflow / unzoned customer pool)
+    float_vehs  = {}   # vehicle_name -> vehicle dict
+
     for _, veh in vehicles_df.iterrows():
         z_raw = str(veh["zone"]).strip()
+        vname = veh["vehicle_name"]
         if not z_raw or z_raw.lower() in ("", "nan", "float", "none"):
+            # Explicit Float — no dedicated zone, serves as overflow
+            float_vehs[vname] = veh.to_dict()
             continue
+        # Any other zone value (including zone = vehicle name) is a real zone
         for z in [x.strip() for x in z_raw.split(",") if x.strip()]:
             if z.lower() not in ("float", "none", "nan"):
                 zone_to_veh[z] = veh.to_dict()
+
+    # Stop lists for Float vehicles (start empty, filled by unzoned distribution)
+    float_stops = {vname: [] for vname in float_vehs}
 
     stops_records = stops_df.to_dict("records")
     for i, rec in enumerate(stops_records):
         rec["_orig_idx"] = i
 
-    zone_stops   = {}
+    zone_stops   = {z: [] for z in zone_to_veh}   # pre-initialize all zones
     unzoned_recs = []
     for rec in stops_records:
         z = str(rec.get("zone", "")).strip()
         if z in zone_to_veh:
-            zone_stops.setdefault(z, []).append(rec)
+            zone_stops[z].append(rec)
         else:
             unzoned_recs.append(rec)
 
@@ -543,6 +614,66 @@ def solve_territory(stops_df, vehicles_df):
         if not changed:
             break
 
+    # ── Distribute unzoned stops (new/unknown-zone customers) ─────────────────
+    # Priority order: 1) Float vehicles (no dedicated zone)
+    #                 2) Zone vehicles that are significantly underutilized
+    if unzoned_recs:
+        def stop_centre(stops_list):
+            if not stops_list:
+                return (config.DEPOT_LAT, config.DEPOT_LON)
+            return (sum(s["latitude"] for s in stops_list) / len(stops_list),
+                    sum(s["longitude"] for s in stops_list) / len(stops_list))
+
+        for rec in list(unzoned_recs):
+            eligible = [x.strip() for x in str(rec.get("eligible_vehicles", "Van")).split(",")]
+            best_key  = None
+            best_score = float("inf")
+            is_float_best = False
+
+            # Option 1 — Float vehicles (full capacity available, top priority)
+            for vname, veh in float_vehs.items():
+                if veh["vehicle_type"] not in eligible:
+                    continue
+                cur = len(float_stops.get(vname, []))
+                if cur >= max_stops:
+                    continue
+                ctr  = stop_centre(float_stops.get(vname, []))
+                dist = haversine_km(rec["latitude"], rec["longitude"], ctr[0], ctr[1])
+                if dist < best_score:
+                    best_score    = dist
+                    best_key      = vname
+                    is_float_best = True
+
+            # Option 2 — Underutilized zone vehicles (< half of max_stops used)
+            for z, veh in zone_to_veh.items():
+                if veh["vehicle_type"] not in eligible:
+                    continue
+                cur  = len(zone_stops.get(z, []))
+                orig = original_counts.get(z, cur)
+                if cur >= max_stops:
+                    continue
+                if orig > max_stops // 2:
+                    continue  # Only significantly underutilized zone vehicles
+                ctr  = stop_centre(zone_stops.get(z, []))
+                dist = haversine_km(rec["latitude"], rec["longitude"], ctr[0], ctr[1])
+                # 100 km equivalent penalty so Float vehicles are strongly preferred
+                score = 100 + dist
+                if score < best_score:
+                    best_score    = score
+                    best_key      = z
+                    is_float_best = False
+
+            if best_key is not None:
+                if is_float_best:
+                    float_stops[best_key].append(rec)
+                    rebalance_notes.setdefault(f"__float_{best_key}", []).append(
+                        f"unzoned customer {rec.get('customer_code','?')} auto-assigned")
+                else:
+                    zone_stops[best_key].append(rec)
+                    rebalance_notes.setdefault(best_key, []).append(
+                        f"unzoned customer {rec.get('customer_code','?')} auto-assigned")
+                unzoned_recs.remove(rec)
+
     zone_summary = []
     for z, veh in sorted(zone_to_veh.items()):
         stops_in   = zone_stops.get(z, [])
@@ -571,17 +702,51 @@ def solve_territory(stops_df, vehicles_df):
             "note":       "  |  ".join(notes),
         })
 
+    # Add Float vehicle entries to zone_summary (only those that received stops)
+    for vname, veh in float_vehs.items():
+        fl_stops = float_stops.get(vname, [])
+        if not fl_stops:
+            continue
+        notes = rebalance_notes.get(f"__float_{vname}", [])
+        zone_summary.append({
+            "vehicle":    vname,
+            "type":       veh["vehicle_type"],
+            "zone":       "Float",
+            "orig_stops": 0,
+            "stops":      len(fl_stops),
+            "kg":         round(sum(s["kg"] for s in fl_stops), 1),
+            "status":     "OK",
+            "note":       "  |  ".join(notes),
+        })
+
     routes = []
     for z, veh in zone_to_veh.items():
         stops_list = zone_stops.get(z, [])
         if not stops_list:
             continue
-        ordered = nearest_neighbor_sequence(stops_list, depot)
+        ordered  = nearest_neighbor_sequence(stops_list, depot)
+        trip_cap = int(veh.get("capacity_kg", 0) or 0) or config.TRIP_CAPACITY.get(veh["vehicle_type"], 3_200)
         routes.append({
             "vehicle_name": veh["vehicle_name"],
             "vehicle_type": veh["vehicle_type"],
             "vehicle_zone": z,
-            "trip_cap":     config.TRIP_CAPACITY.get(veh["vehicle_type"], 3_200),
+            "trip_cap":     trip_cap,
+            "max_trips":    int(veh["max_trips_per_day"]),
+            "stops":        ordered,
+        })
+
+    # Float vehicle routes (vehicles that received unzoned / overflow stops)
+    for vname, veh in float_vehs.items():
+        fl_stops = float_stops.get(vname, [])
+        if not fl_stops:
+            continue
+        ordered  = nearest_neighbor_sequence(fl_stops, depot)
+        trip_cap = int(veh.get("capacity_kg", 0) or 0) or config.TRIP_CAPACITY.get(veh["vehicle_type"], 3_200)
+        routes.append({
+            "vehicle_name": vname,
+            "vehicle_type": veh["vehicle_type"],
+            "vehicle_zone": "Float",
+            "trip_cap":     trip_cap,
             "max_trips":    int(veh["max_trips_per_day"]),
             "stops":        ordered,
         })
@@ -604,6 +769,189 @@ TRIP_HDR_FILL = PatternFill("solid", fgColor="2E75B6")
 OVERLOAD_FILL = PatternFill("solid", fgColor="FFDDC1")
 LIGHT_FILL    = PatternFill("solid", fgColor="FFFACD")
 NO_ORD_FILL   = PatternFill("solid", fgColor="E8E8E8")
+
+
+# ── Route map generator ───────────────────────────────────────────────────────
+
+def generate_route_map(routes) -> str:
+    """Generate a self-contained Leaflet HTML map for the solved routes.
+    Returns HTML string. Filters: vehicle name, vehicle type, trip number."""
+    import json
+
+    # Assign a colour per vehicle (cycle through palette)
+    PALETTE = [
+        "#1A5276","#1E8449","#D35400","#8E44AD","#C0392B","#17A589",
+        "#B7950B","#2980B9","#27AE60","#E67E22","#6C3483","#E74C3C",
+        "#1ABC9C","#F39C12","#5D6D7E","#A93226","#1F618D","#2E86C1",
+        "#52BE80","#CA6F1E","#7D3C98","#117A65","#BA4A00","#154360",
+    ]
+    veh_colours = {}
+    colour_idx  = 0
+    for route in routes:
+        vname = route["vehicle_name"]
+        if vname not in veh_colours:
+            veh_colours[vname] = PALETTE[colour_idx % len(PALETTE)]
+            colour_idx += 1
+
+    # Build GeoJSON features: one per stop
+    features = []
+    all_vehicles   = sorted({r["vehicle_name"] for r in routes})
+    all_types      = sorted({r["vehicle_type"]  for r in routes})
+    all_trip_nums  = sorted({t["trip_num"]
+                             for r in routes
+                             for t in split_into_trips(r)})
+
+    for route in routes:
+        trips = split_into_trips(route)
+        for trip in trips:
+            for stop in trip["stops"]:
+                features.append({
+                    "type": "Feature",
+                    "geometry": {
+                        "type": "Point",
+                        "coordinates": [stop["longitude"], stop["latitude"]],
+                    },
+                    "properties": {
+                        "vehicle":  route["vehicle_name"],
+                        "vtype":    route["vehicle_type"],
+                        "trip":     trip["trip_num"],
+                        "stop":     stop["stop_order"],
+                        "name":     stop["customer_name"],
+                        "street":   stop.get("street", ""),
+                        "kg":       round(stop["kg"], 1),
+                        "cases":    int(stop.get("cases", 0)),
+                        "arrival":  stop["arrival_time"],
+                        "colour":   veh_colours[route["vehicle_name"]],
+                    }
+                })
+
+    geojson_js  = json.dumps({"type": "FeatureCollection", "features": features})
+    vehicles_js = json.dumps(all_vehicles)
+    types_js    = json.dumps(all_types)
+    trips_js    = json.dumps(all_trip_nums)
+
+    html = f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1"/>
+<title>DSD Route Map</title>
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"/>
+<style>
+  *{{box-sizing:border-box;margin:0;padding:0}}
+  body{{font-family:'Segoe UI',sans-serif;display:flex;height:100vh;overflow:hidden}}
+  #sidebar{{width:260px;background:#1F2D3D;color:#ECF0F1;display:flex;flex-direction:column;overflow:hidden;box-shadow:2px 0 8px rgba(0,0,0,.4)}}
+  #sidebar h1{{font-size:14px;font-weight:700;padding:12px 14px 8px;border-bottom:1px solid #2C3E50;color:#fff}}
+  #sidebar h2{{font-size:10px;font-weight:600;text-transform:uppercase;letter-spacing:1px;color:#95A5A6;padding:8px 14px 3px}}
+  #filter-wrap{{flex:1;overflow-y:auto;padding-bottom:10px}}
+  .fs{{padding:0 14px}}.check-row{{display:flex;align-items:center;gap:7px;padding:3px 0;font-size:12px;cursor:pointer;user-select:none}}
+  .check-row input{{cursor:pointer;accent-color:#3498DB;width:13px;height:13px}}
+  .swatch{{width:11px;height:11px;border-radius:50%;flex-shrink:0}}
+  .btn-row{{display:flex;gap:5px;padding:4px 14px}}
+  .btn{{flex:1;padding:4px 0;font-size:10px;font-weight:600;border:none;border-radius:4px;cursor:pointer;background:#2C3E50;color:#BDC3C7}}
+  .btn:hover{{background:#3498DB;color:#fff}}
+  #stats{{padding:6px 14px;font-size:11px;color:#7F8C8D;border-top:1px solid #2C3E50}}
+  #map{{flex:1}}
+  .lf-popup{{font-size:12px;line-height:1.5;min-width:190px}}
+</style>
+</head>
+<body>
+<div id="sidebar">
+  <h1>🚛 DSD Route Map</h1>
+  <div id="filter-wrap">
+    <h2>Vehicle Type</h2>
+    <div class="fs" id="type-f"></div>
+    <div class="btn-row">
+      <button class="btn" onclick="tAll('type',true)">All</button>
+      <button class="btn" onclick="tAll('type',false)">None</button>
+    </div>
+    <h2>Vehicle</h2>
+    <div class="fs" id="veh-f"></div>
+    <div class="btn-row">
+      <button class="btn" onclick="tAll('veh',true)">All</button>
+      <button class="btn" onclick="tAll('veh',false)">None</button>
+    </div>
+    <h2>Trip #</h2>
+    <div class="fs" id="trip-f"></div>
+    <div class="btn-row">
+      <button class="btn" onclick="tAll('trip',true)">All</button>
+      <button class="btn" onclick="tAll('trip',false)">None</button>
+    </div>
+  </div>
+  <div id="stats">Showing <b id="vc">–</b> of <b id="tc">–</b> stops</div>
+</div>
+<div id="map"></div>
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<script>
+const GJ       = {geojson_js};
+const VEHICLES = {vehicles_js};
+const TYPES    = {types_js};
+const TRIPS    = {trips_js};
+
+const map = L.map('map').setView([41.998,21.435],13);
+L.tileLayer('https://{{s}}.tile.openstreetmap.org/{{z}}/{{x}}/{{y}}.png',{{attribution:'© OpenStreetMap',maxZoom:19}}).addTo(map);
+
+const markers=[];
+GJ.features.forEach(f=>{{
+  const p=f.properties;
+  const mk=L.circleMarker([f.geometry.coordinates[1],f.geometry.coordinates[0]],{{
+    radius:7,fillColor:p.colour,color:'#fff',weight:1.5,fillOpacity:0.9
+  }});
+  mk.bindPopup(`<div class="lf-popup"><b>Stop ${{p.stop}} — ${{p.vehicle}}</b><br>
+    Trip ${{p.trip}} &nbsp;|&nbsp; ${{p.vtype}}<br>
+    <b>${{p.name}}</b><br>
+    ${{p.street?'📍 '+p.street+'<br>':''}}
+    ⚖️ ${{p.kg}} kg &nbsp;|&nbsp; 📦 ${{p.cases}} cases<br>
+    🕐 Arrival: ${{p.arrival}}</div>`);
+  mk._v=p.vehicle; mk._t=p.vtype; mk._trip=p.trip;
+  markers.push(mk);
+}});
+const mg=L.layerGroup(markers).addTo(map);
+
+const aV=new Set(VEHICLES), aT=new Set(TYPES), aTr=new Set(TRIPS);
+function apply(){{
+  let vis=0;
+  markers.forEach(m=>{{
+    const ok=aT.has(m._t)&&aV.has(m._v)&&aTr.has(m._trip);
+    if(ok){{if(!map.hasLayer(m))mg.addLayer(m);vis++;}}
+    else{{if(map.hasLayer(m))mg.removeLayer(m);}}
+  }});
+  document.getElementById('vc').textContent=vis;
+}}
+
+function mkCheck(wrap,val,colour,group,set){{
+  const lb=document.createElement('label');lb.className='check-row';
+  lb.innerHTML=`<input type="checkbox" data-g="${{group}}" data-v="${{val}}" checked>
+    <span class="swatch" style="background:${{colour}}"></span><span>${{val}}</span>`;
+  lb.querySelector('input').addEventListener('change',e=>{{
+    e.target.checked?set.add(val):set.delete(val);apply();
+  }});
+  document.getElementById(wrap).appendChild(lb);
+}}
+
+TYPES.forEach(t=>mkCheck('type-f',t,{{Kamion:'#2E86C1',Furgon:'#1E8449',Van:'#D35400'}}[t]||'#7F8C8D','type',aT));
+// Vehicle colours from data
+const vclr={{}};
+GJ.features.forEach(f=>{{vclr[f.properties.vehicle]=f.properties.colour;}});
+VEHICLES.forEach(v=>mkCheck('veh-f',v,vclr[v]||'#7F8C8D','veh',aV));
+TRIPS.forEach(tr=>mkCheck('trip-f','Trip '+tr,'#5D6D7E','trip',aTr));
+
+function tAll(g,s){{
+  document.querySelectorAll(`input[data-g="${{g}}"]`).forEach(cb=>{{
+    cb.checked=s;const v=cb.dataset.v;
+    if(g==='type')s?aT.add(v):aT.delete(v);
+    else if(g==='veh')s?aV.add(v):aV.delete(v);
+    else s?aTr.add('Trip '+parseInt(v.replace('Trip ','')))
+          :aTr.delete('Trip '+parseInt(v.replace('Trip ','')));
+  }});apply();
+}}
+
+document.getElementById('tc').textContent=markers.length;
+apply();
+</script>
+</body>
+</html>"""
+    return html
 
 
 def _style_header(ws):
@@ -830,9 +1178,49 @@ def _main_optimise():
     print()
 
 
+def build_zone_summary_from_routes(routes, original_zone_counts):
+    """Build zone load summary from solved routes for territory mode output."""
+    zone_summary = []
+    for route in routes:
+        vname    = route["vehicle_name"]
+        vzone    = route["vehicle_zone"]
+        stops    = route["stops"]
+        n_stops  = len(stops)
+        total_kg = sum(s["kg"] for s in stops)
+        orig     = original_zone_counts.get(vname, 0)
+
+        in_zone    = sum(1 for s in stops if str(s.get("zone", "")) == vzone)
+        cross_zone = n_stops - in_zone
+
+        if n_stops == 0:
+            status = "NO ORDERS"
+        elif n_stops > config.MAX_STOPS_PER_DAY:
+            status = "OVERLOADED"
+        elif n_stops <= 2:
+            status = "LIGHT"
+        else:
+            status = "OK"
+
+        notes = []
+        if cross_zone > 0:
+            notes.append(f"{cross_zone} stop(s) from other zones (solver reassigned for efficiency)")
+
+        zone_summary.append({
+            "vehicle":    vname,
+            "type":       route["vehicle_type"],
+            "zone":       vzone,
+            "orig_stops": orig,
+            "stops":      n_stops,
+            "kg":         round(total_kg, 1),
+            "status":     status,
+            "note":       "  |  ".join(notes),
+        })
+    return zone_summary
+
+
 def main_territory():
     print("=" * 60)
-    print("  DSD Route Planner - TERRITORY MODE")
+    print("  DSD Route Planner - TERRITORY MODE (zone-affinity solver)")
     print("=" * 60)
 
     print(f"\nLoading orders and vehicles from '{config.TODAY_FILE}'...")
@@ -848,6 +1236,7 @@ def main_territory():
     print(f"  Total KG        : {total_kg:,.1f}")
     print(f"  Vehicles avail  : {n_veh}")
     print(f"  Vehicles w/zone : {n_with_zone}")
+    print(f"  Zone penalty    : {config.ZONE_AFFINITY_PENALTY_KM} km equivalent")
 
     if n_with_zone == 0:
         sys.exit(
@@ -855,13 +1244,30 @@ def main_territory():
             "  Run suggest_zones.bat first."
         )
 
+    # Pre-compute how many of today's stops belong to each vehicle's zone
+    vehicle_zones = {}
+    for _, row in vehicles_df.iterrows():
+        z = str(row["zone"]).strip()
+        if z.lower() not in ("", "nan", "float", "none"):
+            vehicle_zones[row["vehicle_name"]] = z
+
+    original_zone_counts = {}
+    for _, row in stops_df.iterrows():
+        sz = str(row.get("zone", "")).strip()
+        for vname, vzone in vehicle_zones.items():
+            if vzone == sz:
+                original_zone_counts[vname] = original_zone_counts.get(vname, 0) + 1
+                break
+
     print(f"\n  Load by zone:")
     zone_load = stops_df.groupby("zone").agg(stops=("kg", "count"), kg=("kg", "sum"))
     for zone, zrow in zone_load.iterrows():
-        print(f"    {zone:<18} {zrow['stops']:>3} stops   {zrow['kg']:>8,.1f} kg")
+        print(f"    {zone:<22} {zrow['stops']:>3} stops   {zrow['kg']:>8,.1f} kg")
 
-    print(f"\nBuilding territory routes and rebalancing...")
-    routes, unassigned, zone_summary = solve_territory(stops_df, vehicles_df)
+    print(f"\nSolving with zone affinity (up to {config.SOLVER_TIME_LIMIT_SECONDS} s)...")
+    routes, unassigned, stops_df = solve(stops_df, vehicles_df, zone_affinity=True)
+
+    zone_summary = build_zone_summary_from_routes(routes, original_zone_counts)
 
     write_excel(routes, stops_df, unassigned, config.OUTPUT_FILE, zone_summary)
 
@@ -877,13 +1283,13 @@ def main_territory():
     if unassigned:
         print(f"  UNASSIGNED      : {len(unassigned)} stop(s) -> see 'Unassigned' sheet")
 
-    print(f"\n  Final stop distribution after rebalancing:")
+    print(f"\n  Final stop distribution:")
     for zrow in sorted(zone_summary, key=lambda z: -z["stops"]):
         if zrow["stops"] == 0: continue
         orig  = zrow.get("orig_stops", zrow["stops"])
         delta = zrow["stops"] - orig
-        arrow = f"  ({'+' if delta >= 0 else ''}{delta} rebalanced)" if delta != 0 else ""
-        print(f"    {zrow['vehicle']:<22} {zrow['zone']:<18} "
+        arrow = f"  ({'+' if delta >= 0 else ''}{delta} solver reassigned)" if delta != 0 else ""
+        print(f"    {zrow['vehicle']:<22} {zrow['zone']:<22} "
               f"{zrow['stops']:>3} stops  {zrow['kg']:>9,.1f} kg{arrow}")
 
     print(f"\n  Zone status summary:")
@@ -892,6 +1298,9 @@ def main_territory():
         print(f"    OVERLOADED     : {len(overloaded)} ({', '.join(z['zone'] for z in overloaded)})")
     if light:
         print(f"    LIGHT (<3 stop): {len(light)} ({', '.join(z['zone'] for z in light)})")
+    if no_orders:
+        print(f"    NO ORDERS      : {len(no_orders)} vehicles idle today")
+    print()
     if no_orders:
         print(f"    NO ORDERS      : {len(no_orders)} vehicles idle today")
     print()

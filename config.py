@@ -1,103 +1,52 @@
-# ─────────────────────────────────────────────────────────────────────────────
-#  config.py  –  Master configuration. Edit once; do not change daily.
-# ─────────────────────────────────────────────────────────────────────────────
+﻿# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+#  config.py  â€“  Static configuration only. Fleet is managed in today.xlsx.
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
-# ── Depot ─────────────────────────────────────────────────────────────────────
+# â”€â”€ Depot â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 DEPOT_LAT = 42.0050
 DEPOT_LON  = 21.4000
 
 DEPOT_OPEN  = "05:30"
 DEPOT_CLOSE = "20:00"
 
-# ── Current fleet definition ─────────────────────────────────────────────────
-FLEET = [
-    # Kamion (14)
-    {"name": "KAMION_01",  "type": "Kamion"},
-    {"name": "KAMION_02",  "type": "Kamion"},
-    {"name": "KAMION_03",  "type": "Kamion"},
-    {"name": "KAMION_04",  "type": "Kamion"},
-    {"name": "KAMION_05",  "type": "Kamion"},
-    {"name": "KAMION_06",  "type": "Kamion"},
-    {"name": "KAMION_07",  "type": "Kamion"},
-    {"name": "KAMION_08",  "type": "Kamion"},
-    {"name": "KAMION_09",  "type": "Kamion"},
-    {"name": "KAMION_10",  "type": "Kamion"},
-    {"name": "KAMION_11",  "type": "Kamion"},
-    {"name": "KAMION_12",  "type": "Kamion"},
-    {"name": "KAMION_13",  "type": "Kamion"},
-    {"name": "KAMION_14",  "type": "Kamion"},
-    # Furgon (19)
-    {"name": "FURGON_01",  "type": "Furgon"},
-    {"name": "FURGON_02",  "type": "Furgon"},
-    {"name": "FURGON_03",  "type": "Furgon"},
-    {"name": "FURGON_04",  "type": "Furgon"},
-    {"name": "FURGON_05",  "type": "Furgon"},
-    {"name": "FURGON_06",  "type": "Furgon"},
-    {"name": "FURGON_07",  "type": "Furgon"},
-    {"name": "FURGON_08",  "type": "Furgon"},
-    {"name": "FURGON_09",  "type": "Furgon"},
-    {"name": "FURGON_10",  "type": "Furgon"},
-    {"name": "FURGON_11",  "type": "Furgon"},
-    {"name": "FURGON_12",  "type": "Furgon"},
-    {"name": "FURGON_13",  "type": "Furgon"},
-    {"name": "FURGON_14",  "type": "Furgon"},
-    {"name": "FURGON_15",  "type": "Furgon"},
-    {"name": "FURGON_16",  "type": "Furgon"},
-    {"name": "FURGON_17",  "type": "Furgon"},
-    {"name": "FURGON_18",  "type": "Furgon"},
-    {"name": "FURGON_19",  "type": "Furgon"},
-    # Van (11)
-    {"name": "VAN_01",     "type": "Van"},
-    {"name": "VAN_02",     "type": "Van"},
-    {"name": "VAN_03",     "type": "Van"},
-    {"name": "VAN_04",     "type": "Van"},
-    {"name": "VAN_05",     "type": "Van"},
-    {"name": "VAN_06",     "type": "Van"},
-    {"name": "VAN_07",     "type": "Van"},
-    {"name": "VAN_08",     "type": "Van"},
-    {"name": "VAN_09",     "type": "Van"},
-    {"name": "VAN_10",     "type": "Van"},
-    {"name": "VAN_11",     "type": "Van"},
-]
-
-# ── Trip capacities (kg per single loaded trip) ────────────────────────────────
+# â”€â”€ Trip capacities â€” type-level fallback when capacity_kg is blank â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 TRIP_CAPACITY = {
     "Kamion": 6_000,
     "Furgon": 5_200,
     "Van":    3_200,
 }
 
-# ── Multi-trip limits ─────────────────────────────────────────────────────────
+# â”€â”€ Multi-trip limits â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 MAX_TRIPS_NORMAL = 2
 MAX_TRIPS_PEAK   = 3
 MAX_DRIVER_HOURS = 10
 
-# ── Routing parameters ────────────────────────────────────────────────────────
+# â”€â”€ Routing parameters â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 AVERAGE_SPEED_KMH  = 40
 ROAD_FACTOR        = 1.3
 AVG_SERVICE_MIN    = 12
-SOLVER_TIME_LIMIT_SECONDS = 120
+SOLVER_TIME_LIMIT_SECONDS = 300
 
-# ── Customer eligibility thresholds ──────────────────────────────────────────
+# â”€â”€ Zone affinity (SMART mode) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# Penalty when solver assigns a stop outside its home vehicle zone.
+# In km-equivalent. 20 km suits Skopje (~15 km city diameter).
+ZONE_AFFINITY_PENALTY_KM = 20
+
+# â”€â”€ Customer eligibility thresholds â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 NEW_CUSTOMER_DEFAULT_VEHICLES = ["Kamion", "Van"]
 FURGON_ELIGIBLE_FROM_KAMION_PCT = 10
 KAMION_ELIGIBLE_FROM_VAN_PCT    = 15
 FURGON_ELIGIBLE_FROM_VAN_PCT    = 15
 
-# ── Stop count cap ────────────────────────────────────────────────────────────
+# â”€â”€ Stop count cap â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 MAX_STOPS_PER_DAY = 12
 
-# ── Geo clustering ────────────────────────────────────────────────────────────
-# One territory zone per vehicle (14 Kamion + 19 Furgon + 11 Van = 44 vehicles).
-# Plostad occupies 1 Kamion slot, Carsija occupies 1 Van slot, so the dynamic
-# clusters total 42 (13 + 19 + 10) + 2 special = 44 zones = 44 vehicles.
-N_CLUSTERS_TERRITORY_PER_TYPE = {
-    "Kamion": 13,   # 14 total minus 1 for Plostad
-    "Furgon": 19,
-    "Van":    10,   # 11 total minus 1 for Carsija
-}
+# â”€â”€ Geo clustering (used by build_customer_master.py) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# Cluster counts are derived dynamically from the Vehicles sheet at build time.
+# These are fallback counts used only when no vehicles file is present.
+N_CLUSTERS_FALLBACK = {"Kamion": 13, "Furgon": 19, "Van": 10}
 
-# ── Special zones (manually defined, override clustering) ─────────────────────
+# â”€â”€ Special zones (manually defined, override clustering) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 SPECIAL_ZONES = {
     "Plostad": {
         "polygon": [
@@ -132,8 +81,9 @@ SPECIAL_ZONES = {
     },
 }
 
-# ── Files ─────────────────────────────────────────────────────────────────────
+# â”€â”€ Files â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 HISTORICAL_FILE = "_setup/Za model.xlsx"
 CUSTOMER_MASTER = "_setup/customer_master.xlsx"
 TODAY_FILE      = "today.xlsx"
 OUTPUT_FILE     = "routes_output.xlsx"
+

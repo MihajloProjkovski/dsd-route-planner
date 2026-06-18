@@ -242,14 +242,14 @@ def main():
             print(f"    {f['customer_code']}  {f['customer_name'][:30]:30s}  "
                   f"[{f['zone']}]  dominant={f['dominant_in_history']}")
 
-    total_clusters = sum(config.N_CLUSTERS_TERRITORY_PER_TYPE.values())
-    print(f"\nClustering into {total_clusters} territory zones "
-          f"({config.N_CLUSTERS_TERRITORY_PER_TYPE})...")
+    total_clusters = sum(config.N_CLUSTERS_FALLBACK.values())
+    print(f"\nClustering into {total_clusters} initial zones "
+          f"(fallback: {config.N_CLUSTERS_FALLBACK})...")
 
     mask_ns = cust["special_zone"].isna()
     centres = {}
 
-    for vtype, n_clust in config.N_CLUSTERS_TERRITORY_PER_TYPE.items():
+    for vtype, n_clust in config.N_CLUSTERS_FALLBACK.items():
         mask_type = mask_ns & (cust["preferred_vehicle"] == vtype)
         subset    = cust.loc[mask_type]
 
@@ -350,71 +350,23 @@ def main():
     if flags:
         print(f"  {len(flags)} flagged customers -> 'Flags - Review' sheet.")
 
-    today_path = config.TODAY_FILE
-    print(f"\nBuilding '{config.TODAY_FILE}' (daily input: Orders + Vehicles sheets)...")
-
-    type_fills = {
-        "Kamion": PatternFill("solid", fgColor="D6E4F7"),
-        "Furgon": PatternFill("solid", fgColor="D6F7E4"),
-        "Van":    PatternFill("solid", fgColor="FFF3CD"),
-    }
-
-    wb2 = openpyxl.Workbook()
-
-    ws_ord = wb2.active
-    ws_ord.title = "Orders"
-    ws_ord.append(["customer_code", "customer_name", "cases", "kg"])
-    _style_header(ws_ord)
-    for col_letter, width in zip(["A", "B", "C", "D"], [18, 35, 10, 12]):
-        ws_ord.column_dimensions[col_letter].width = width
-    ws_ord.freeze_panes = "A2"
-
-    ws_veh = wb2.create_sheet("Vehicles")
-    v_cols = ["vehicle_name", "vehicle_type", "zone", "available", "max_trips_per_day", "notes"]
-    ws_veh.append(v_cols)
-    _style_header(ws_veh)
-    for v in config.FLEET:
-        ws_veh.append([v["name"], v["type"], "", True, config.MAX_TRIPS_NORMAL, ""])
-        fill = type_fills.get(v["type"])
-        if fill:
-            for cell in ws_veh[ws_veh.max_row]:
-                cell.fill = fill
-    ws_veh.append([])
-    ws_veh.append(["HOW TO USE THIS SHEET:"])
-    ws_veh.append(["zone      -> Zone from _setup/customer_master.xlsx Zone Summary "
-                   "(e.g. Kamion_03, Plostad, Carsija). Use Float for overflow."])
-    ws_veh.append(["available -> TRUE = available today, FALSE = maintenance/absent"])
-    ws_veh.append(["max_trips -> 2 = normal day, 3 = high-demand day"])
-    for col in ws_veh.columns:
-        ml = max((len(str(c.value or "")) for c in col), default=0)
-        ws_veh.column_dimensions[get_column_letter(col[0].column)].width = min(ml + 3, 80)
-    ws_veh.freeze_panes = "A2"
-
-    wb2.save(today_path)
-    print(f"  Saved: {today_path}")
-    print(f"  Orders sheet  : blank, ready for daily orders")
-    print(f"  Vehicles sheet: {len(config.FLEET)} vehicles pre-filled")
-
     print("\n" + "=" * 60)
     print("  Setup complete!")
     print("=" * 60)
     print("""
+Customer master built successfully.
+
 Next steps:
-  1. Open 'today.xlsx' in the main folder.
-     -> Vehicles sheet: fill the 'zone' column for each vehicle.
-        Use zone names from _setup/customer_master.xlsx Zone Summary.
-        Examples: Kamion_03  Plostad  Carsija  Float
-     -> Carsija zone -> Van only.
-     -> Plostad zone -> Kamion.
+  1. Download the blank today.xlsx template from the web app
+     (Admin -> Fleet & Zones -> Download blank template).
+     Fill in your vehicles, then use it daily.
 
   2. Review 'Flags - Review' in _setup/customer_master.xlsx
-     for any customers whose history conflicts with zone rules.
+     for customers whose history conflicts with zone rules.
 
-  3. Each morning:
-     -> Open today.xlsx
-     -> Orders sheet  : paste today's customer codes + quantities
-     -> Vehicles sheet: set available=FALSE for absent vehicles
-     -> Save -> double-click run.bat -> open routes_output.xlsx
+  3. Update zone assignments in customer_master.xlsx:
+     Each customer's 'zone' column = the vehicle name that serves them.
+     Example: 'DSD 6' serves Plostad area customers.
 """)
 
 

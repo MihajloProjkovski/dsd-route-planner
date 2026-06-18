@@ -35,87 +35,12 @@ def suggest_assignments():
     if not os.path.exists(master):
         sys.exit(f"ERROR: {master} not found. Run _setup/run_setup.bat first.")
     if not os.path.exists(today):
-        sys.exit(f"ERROR: {today} not found. Run _setup/run_setup.bat first.")
-
-    # Load zone summary
-    zs = pd.read_excel(master, sheet_name="Zone Summary")
-    zs.columns = zs.columns.str.strip().str.lower().str.replace(" ", "_")
-    zs = zs.dropna(subset=["zone"]).copy()
-
-    # Build per-type zone queues, heaviest first
-    special_primary = {
-        name: zdef["primary_vehicle"]
-        for name, zdef in config.SPECIAL_ZONES.items()
-    }
-
-    special_rows = zs[zs["zone"].isin(special_primary.keys())].copy()
-    dynamic_rows = zs[~zs["zone"].isin(special_primary.keys())].copy()
-    dynamic_rows = dynamic_rows.sort_values("avg_weight", ascending=False)
-
-    queues = {"Kamion": [], "Furgon": [], "Van": []}
-
-    for _, row in special_rows.iterrows():
-        vtype = special_primary[row["zone"]]
-        if vtype in queues:
-            queues[vtype].insert(0, row["zone"])
-
-    for _, row in dynamic_rows.iterrows():
-        vtype = row["dominant_veh"]
-        if vtype in queues:
-            queues[vtype].append(row["zone"])
-
-    vehicles_by_type = {"Kamion": [], "Furgon": [], "Van": []}
-    for v in config.FLEET:
-        if v["type"] in vehicles_by_type:
-            vehicles_by_type[v["type"]].append(v["name"])
-
-    assignments = {}
-    secondary   = {}
-    remaining_queues = {k: list(v) for k, v in queues.items()}
-
-    for vtype, veh_names in vehicles_by_type.items():
-        zone_queue = remaining_queues.get(vtype, [])
-        for vname in veh_names:
-            if zone_queue:
-                assignments[vname] = zone_queue.pop(0)
-            else:
-                assignments[vname] = "Float"
-
-    unassigned_zones = [z for zq in remaining_queues.values() for z in zq]
-    for leftover_zone in unassigned_zones:
-        vtype = leftover_zone.split("_")[0] if "_" in leftover_zone else "Kamion"
-        if vtype not in vehicles_by_type:
-            vtype = "Kamion"
-        float_veh = next(
-            (v for v in reversed(vehicles_by_type[vtype])
-             if assignments.get(v) == "Float"),
-            None
-        )
-        if float_veh:
-            secondary[float_veh] = leftover_zone
+        sys.exit(f"ERROR: {today} not found.")
 
     print("=" * 55)
-    print("  Zone Assignment Suggestion")
+    print("  Zone Assignment — set zone = vehicle name for all")
     print("=" * 55)
-
-    counts = {"Kamion": 0, "Furgon": 0, "Van": 0}
-    for vtype, veh_names in vehicles_by_type.items():
-        print(f"\n  {vtype} ({len(veh_names)} vehicles):")
-        for vname in veh_names:
-            zone = assignments[vname]
-            sec  = secondary.get(vname, "")
-            if zone == "Float":
-                tag = "  [overflow]"
-            elif sec:
-                tag = f"  + covers {sec} (secondary)"
-            else:
-                tag = ""
-            print(f"    {vname:<22} -> {zone}{tag}")
-            if zone != "Float":
-                counts[vtype] += 1
-
-    print(f"\n  Zones assigned : {sum(counts.values())}")
-    print(f"  Float vehicles : {sum(1 for z in assignments.values() if z == 'Float')}")
+    print("\n  Every vehicle gets its own name as its zone.\n")
 
     wb = openpyxl.load_workbook(today)
 
@@ -125,7 +50,8 @@ def suggest_assignments():
     ws = wb["Vehicles"]
     header = {cell.value: cell.column for cell in ws[1] if cell.value}
     name_col = header.get("vehicle_name")
-    zone_col = header.get("zone")
+    zone_col  = header.get("zone")
+    type_col  = header.get("vehicle_type")
 
     if not name_col or not zone_col:
         sys.exit("ERROR: Vehicles sheet must have 'vehicle_name' and 'zone' columns.")
@@ -137,17 +63,12 @@ def suggest_assignments():
         vname = str(vname_cell.value).strip() if vname_cell.value else ""
         if not vname or vname == "None" or vname.startswith("HOW TO"):
             continue
-        if vname in assignments:
-            primary = assignments[vname]
-            sec     = secondary.get(vname, "")
-            zone_cell.value = f"{primary},{sec}" if sec else primary
-            fill = FLOAT_FILL if primary == "Float" else TYPE_FILLS.get(
-                next((v["type"] for v in config.FLEET if v["name"] == vname), ""), None
-            )
-            if fill:
-                for cell in row:
-                    cell.fill = fill
-            updated += 1
+        zone_cell.value = vname   # zone = vehicle name
+        vtype = str(row[type_col - 1].value).strip() if type_col else ""
+        fill  = TYPE_FILLS.get(vtype, FLOAT_FILL)
+        for cell in row:
+            cell.fill = fill
+        updated += 1
 
     try:
         wb.save(today)
@@ -156,9 +77,8 @@ def suggest_assignments():
         print(f"  Close today.xlsx and run suggest_zones.bat again.\n")
         sys.exit(1)
 
-    print(f"\n  Saved to '{today}' - {updated} vehicles updated.")
-    print("\n  You can manually override any zone in today.xlsx Vehicles sheet.")
-    print("  Use 'Float' for vehicles you want to serve any zone as overflow.\n")
+    print(f"\n  Saved to '{today}' — {updated} vehicles updated.")
+    print("  Zone = vehicle name. Vehicles with no name get Float.\n")
 
 
 if __name__ == "__main__":

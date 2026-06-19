@@ -919,30 +919,30 @@ function apply(){{
   document.getElementById('vc').textContent=vis;
 }}
 
-function mkCheck(wrap,val,colour,group,set){{
+function mkCheck(wrap,label,val,colour,group,set){{
   const lb=document.createElement('label');lb.className='check-row';
   lb.innerHTML=`<input type="checkbox" data-g="${{group}}" data-v="${{val}}" checked>
-    <span class="swatch" style="background:${{colour}}"></span><span>${{val}}</span>`;
+    <span class="swatch" style="background:${{colour}}"></span><span>${{label}}</span>`;
   lb.querySelector('input').addEventListener('change',e=>{{
     e.target.checked?set.add(val):set.delete(val);apply();
   }});
   document.getElementById(wrap).appendChild(lb);
 }}
 
-TYPES.forEach(t=>mkCheck('type-f',t,{{Kamion:'#2E86C1',Furgon:'#1E8449',Van:'#D35400'}}[t]||'#7F8C8D','type',aT));
-// Vehicle colours from data
+TYPES.forEach(t=>mkCheck('type-f',t,t,{{Kamion:'#2E86C1',Furgon:'#1E8449',Van:'#D35400'}}[t]||'#7F8C8D','type',aT));
 const vclr={{}};
 GJ.features.forEach(f=>{{vclr[f.properties.vehicle]=f.properties.colour;}});
-VEHICLES.forEach(v=>mkCheck('veh-f',v,vclr[v]||'#7F8C8D','veh',aV));
-TRIPS.forEach(tr=>mkCheck('trip-f','Trip '+tr,'#5D6D7E','trip',aTr));
+VEHICLES.forEach(v=>mkCheck('veh-f',v,v,vclr[v]||'#7F8C8D','veh',aV));
+TRIPS.forEach(tr=>mkCheck('trip-f','Trip '+tr,tr,'#5D6D7E','trip',aTr));
 
 function tAll(g,s){{
   document.querySelectorAll(`input[data-g="${{g}}"]`).forEach(cb=>{{
-    cb.checked=s;const v=cb.dataset.v;
-    if(g==='type')s?aT.add(v):aT.delete(v);
-    else if(g==='veh')s?aV.add(v):aV.delete(v);
-    else s?aTr.add('Trip '+parseInt(v.replace('Trip ','')))
-          :aTr.delete('Trip '+parseInt(v.replace('Trip ','')));
+    cb.checked=s;
+    const rawVal=cb.dataset.v;
+    const val=(g==='trip')?parseInt(rawVal):rawVal;
+    if(g==='type')s?aT.add(val):aT.delete(val);
+    else if(g==='veh')s?aV.add(val):aV.delete(val);
+    else s?aTr.add(val):aTr.delete(val);
   }});apply();
 }}
 

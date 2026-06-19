@@ -34,6 +34,12 @@ st.markdown("""
   div[data-testid="metric-container"] {
     background: #f8f9fa; border-radius: 8px; padding: 8px;
   }
+  /* Hide Streamlit toolbar (share, star, edit, github icons) */
+  header[data-testid="stHeader"] { display: none; }
+  #MainMenu { visibility: hidden; }
+  footer { visibility: hidden; }
+  div[data-testid="stToolbar"] { display: none; }
+  div[data-testid="stDecoration"] { display: none; }
 </style>
 """, unsafe_allow_html=True)
 
@@ -252,18 +258,19 @@ elif page == "⚙️ Admin":
         st.subheader("Customer Master")
         mp = config.CUSTOMER_MASTER
         if os.path.exists(mp):
-            mdf = pd.read_excel(mp, sheet_name="Customers")
-            c1,c2,c3 = st.columns(3)
-            c1.metric("Customers", len(mdf))
-            c2.metric("Zones", mdf["zone"].nunique())
-            c3.metric("With History", int((mdf["visits"]>0).sum()))
-            zd = (mdf.groupby("zone").agg(
-                customers=("customer_code","count"),
-                dominant=("preferred_vehicle", lambda x: x.value_counts().index[0]),
-                avg_kg=("avg_weight_kg","mean")).round(1).reset_index())
-            st.dataframe(zd, use_container_width=True, hide_index=True, height=300)
+            try:
+                mdf = pd.read_excel(mp, sheet_name="Customers")
+                c1,c2,c3 = st.columns(3)
+                c1.metric("Customers", len(mdf))
+                c2.metric("Zones", mdf["zone"].nunique() if "zone" in mdf.columns else "—")
+                visits_col = next((c for c in mdf.columns if "visit" in c.lower()), None)
+                c3.metric("With History", int((mdf[visits_col]>0).sum()) if visits_col else "—")
+                disp_cols = [c for c in ["customer_code","customer_name","zone","preferred_vehicle","avg_weight_kg"] if c in mdf.columns]
+                st.dataframe(mdf[disp_cols].head(500), use_container_width=True, hide_index=True, height=300)
+            except Exception as e:
+                st.error(f"Error reading customer master: {e}")
         else:
-            st.warning("customer_master.xlsx not found.")
+            st.info("No customer master uploaded yet. Use the Upload button below.")
         st.markdown("---")
         cu, cd = st.columns(2)
         with cu:
@@ -285,11 +292,16 @@ elif page == "⚙️ Admin":
         st.subheader("Add New Customer")
         mp2 = config.CUSTOMER_MASTER
         if not os.path.exists(mp2):
-            st.error("Customer master not found.")
+            st.info("Upload a customer master first (Customer Master tab).")
         else:
-            mdf2 = pd.read_excel(mp2, sheet_name="Customers")
-            mdf2["customer_code"] = mdf2["customer_code"].astype(str)
-            zones_list = sorted(mdf2["zone"].dropna().unique().tolist())
+            try:
+                mdf2 = pd.read_excel(mp2, sheet_name="Customers")
+                mdf2["customer_code"] = mdf2["customer_code"].astype(str)
+                zones_list = sorted(mdf2["zone"].dropna().unique().tolist()) if "zone" in mdf2.columns else ["Float"]
+            except Exception as e:
+                st.error(f"Could not read customer master: {e}")
+                zones_list = ["Float"]
+                mdf2 = pd.DataFrame()
             with st.form("new_cust_form"):
                 col1, col2 = st.columns(2)
                 with col1:
@@ -341,9 +353,20 @@ elif page == "⚙️ Admin":
 | `max_trips_per_day` | `2` normal, `3` heavy |
 """)
         if os.path.exists(config.CUSTOMER_MASTER):
-            st.markdown("**Zone Summary from Customer Master**")
-            mdf3 = pd.read_excel(config.CUSTOMER_MASTER, sheet_name="Zone Summary")
-            st.dataframe(mdf3, use_container_width=True, hide_index=True, height=260)
+            try:
+                xl = pd.ExcelFile(config.CUSTOMER_MASTER)
+                if "Zone Summary" in xl.sheet_names:
+                    mdf3 = xl.parse("Zone Summary")
+                    st.markdown("**Zone Summary from Customer Master**")
+                    st.dataframe(mdf3, use_container_width=True, hide_index=True, height=260)
+                elif "Customers" in xl.sheet_names:
+                    mdf3 = xl.parse("Customers")
+                    if "zone" in mdf3.columns:
+                        zsum = mdf3.groupby("zone").size().reset_index(name="customers")
+                        st.markdown("**Zone Summary (from Customers sheet)**")
+                        st.dataframe(zsum, use_container_width=True, hide_index=True, height=260)
+            except Exception as e:
+                st.warning(f"Could not load zone summary: {e}")
 
     with tab_cfg:
         st.subheader("Configuration")

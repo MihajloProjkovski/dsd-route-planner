@@ -1,10 +1,12 @@
-﻿"""
+"""
 app.py - DSD Route Planner Web Application
 """
 
 import io
 import os
 import sys
+import time
+import threading
 from datetime import date
 
 import openpyxl
@@ -123,6 +125,16 @@ def run_routing(file_bytes: bytes, mode: str):
     return excel_buf.getvalue(), routes, stops_df, unassigned, zone_summary, map_html
 
 
+def run_routing_threaded(file_bytes: bytes, mode: str, result_holder: dict):
+    """Wrapper that runs run_routing in a thread and stores result/error."""
+    try:
+        result_holder["result"] = run_routing(file_bytes, mode)
+    except SystemExit as e:
+        result_holder["error"] = str(e)
+    except Exception as e:
+        result_holder["error"] = str(e)
+
+
 def check_zones_assigned(file_bytes: bytes) -> bool:
     try:
         xl  = pd.ExcelFile(io.BytesIO(file_bytes))
@@ -168,18 +180,57 @@ if page == "🗺 Route Planning":
                        "Switch to FREE mode or set zones in the Vehicles sheet.")
 
         if st.button("▶  Generate Routes", type="primary"):
-            with st.spinner(f"Running {'SMART' if mode=='smart' else 'FREE'} routing "
-                            f"(up to {config.SOLVER_TIME_LIMIT_SECONDS//60} min)…"):
-                try:
-                    excel_bytes, routes, stops_df, unassigned, zone_summary, map_html = \
-                        run_routing(file_bytes, mode)
-                    st.session_state.update({
-                        "excel_bytes": excel_bytes, "routes": routes,
-                        "stops_count": len(stops_df), "unassigned": unassigned,
-                        "zone_summary": zone_summary, "map_html": map_html,
-                    })
-                except SystemExit as e:
-                    st.error(f"❌ {e}")
+            max_sec   = config.SOLVER_TIME_LIMIT_SECONDS
+            mode_name = "SMART" if mode == "smart" else "FREE"
+
+            st.markdown(f"**Running {mode_name} routing...**")
+            progress_bar  = st.progress(0)
+            status_text   = st.empty()
+
+            result_holder = {}
+            thread = threading.Thread(
+                target=run_routing_threaded,
+                args=(file_bytes, mode, result_holder),
+                daemon=True,
+            )
+            thread.start()
+
+            start = time.time()
+            phases = [
+                (0.05, "Loading orders and vehicles..."),
+                (0.10, "Building distance matrix..."),
+                (0.18, "Finding initial solution..."),
+                (0.90, f"Optimising routes (up to {max_sec}s)..."),
+                (0.97, "Writing output files..."),
+            ]
+            phase_idx = 0
+
+            while thread.is_alive():
+                elapsed  = time.time() - start
+                # Time-based progress: 0→95% over max_sec, then hold
+                raw_prog = min(elapsed / max_sec, 0.95)
+                # Advance through named phases
+                while phase_idx < len(phases) and raw_prog >= phases[phase_idx][0]:
+                    phase_idx += 1
+                label = phases[min(phase_idx, len(phases)-1)][1]
+                progress_bar.progress(raw_prog, text=label)
+                status_text.caption(f"Elapsed: {int(elapsed)}s / {max_sec}s")
+                time.sleep(0.5)
+
+            progress_bar.progress(1.0, text="Done!")
+            status_text.empty()
+
+            if "error" in result_holder:
+                st.error(f"❌ {result_holder['error']}")
+            else:
+                excel_bytes, routes, stops_df, unassigned, zone_summary, map_html = \
+                    result_holder["result"]
+                st.session_state.update({
+                    "excel_bytes": excel_bytes, "routes": routes,
+                    "stops_count": len(stops_df), "unassigned": unassigned,
+                    "zone_summary": zone_summary, "map_html": map_html,
+                })
+                st.rerun()
 
     if "excel_bytes" in st.session_state:
         c1, c2, c3 = st.columns(3)

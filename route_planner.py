@@ -405,7 +405,7 @@ def solve(stops_df, vehicles_df, zone_affinity=False):
     time_cb_idx = routing.RegisterTransitCallback(time_cb)
     routing.AddDimension(time_cb_idx, 60, 24 * 60, False, "Time")
     time_dim = routing.GetDimensionOrDie("Time")
-    time_dim.SetGlobalSpanCostCoefficient(10)
+    time_dim.SetGlobalSpanCostCoefficient(60)   # higher = more equal workloads across vehicles
 
     for node in range(1, n_nodes):
         idx = manager.NodeToIndex(node)
@@ -499,6 +499,56 @@ def solve(stops_df, vehicles_df, zone_affinity=False):
         ri = manager.NodeToIndex(node)
         if solution.Value(routing.NextVar(ri)) == ri:
             unassigned_indices.append(node - 1)
+
+    # ── Post-solve rebalancing: eliminate stragglers (vehicles with <=2 stops) ──
+    # For each vehicle with very few stops, try to move its stops to a
+    # geographically nearby vehicle with spare capacity, then mark it empty.
+    STRAGGLER_THRESHOLD = 3   # vehicles with fewer stops than this get rebalanced
+    changed = True
+    passes  = 0
+    while changed and passes < 5:
+        changed = False
+        passes += 1
+        for i, route in enumerate(routes):
+            if len(route["stops"]) == 0 or len(route["stops"]) >= STRAGGLER_THRESHOLD:
+                continue
+            # This vehicle is a straggler — try to move all its stops elsewhere
+            moves = []
+            for stop in route["stops"]:
+                eligible_types = [x.strip() for x in
+                                  str(stop.get("eligible_veh", "Van")).split(",")]
+                best_j    = None
+                best_dist = float("inf")
+                for j, other in enumerate(routes):
+                    if j == i or len(other["stops"]) == 0:
+                        continue
+                    if other["vehicle_type"] not in eligible_types:
+                        continue
+                    if len(other["stops"]) >= config.MAX_STOPS_PER_DAY:
+                        continue
+                    # Check weight capacity on last trip
+                    total_kg = sum(s["kg"] for s in other["stops"])
+                    if total_kg + stop["kg"] > other["trip_cap"] * other["max_trips"]:
+                        continue
+                    # Prefer geographically closest vehicle (by last stop position)
+                    last = other["stops"][-1]
+                    d = haversine_km(stop["latitude"], stop["longitude"],
+                                     last["latitude"], last["longitude"])
+                    if d < best_dist:
+                        best_dist = d
+                        best_j    = j
+                if best_j is not None:
+                    moves.append((stop, best_j))
+
+            # Only rebalance if ALL stops of this vehicle found a new home
+            if len(moves) == len(route["stops"]):
+                for stop, j in moves:
+                    routes[j]["stops"].append(stop)
+                route["stops"] = []
+                changed = True
+
+    # Remove now-empty routes
+    routes = [r for r in routes if r["stops"]]
 
     return routes, unassigned_indices, stops_df
 

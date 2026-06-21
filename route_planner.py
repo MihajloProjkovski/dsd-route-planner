@@ -267,18 +267,119 @@ def solve(stops_df, vehicles_df, zone_affinity=False):
 
     if zone_affinity:
         # ── Per-vehicle arc costs with zone affinity penalty ──────────────────
-        # Stops assigned to a vehicle outside its zone pay a distance penalty
-        # equivalent to ZONE_AFFINITY_PENALTY_KM. This strongly discourages
-        # cross-zone assignments but allows them when routing math demands it.
-        penalty_m = int(config.ZONE_AFFINITY_PENALTY_KM * 1_000)
+        penalty_m       = int(config.ZONE_AFFINITY_PENALTY_KM * 1_000)
+        float_penalty_m = penalty_m // 2   # Float vehicles use half the penalty
         stop_zones = [str(stops_df.iloc[i].get("zone", "")) for i in range(len(stops_df))]
 
+        # ── Geographic clustering for Float vehicles ──────────────────────────
+        # Identify stops that no zone vehicle "owns" (their zone doesn't match
+        # any zone vehicle). These are the stops Float vehicles will likely serve.
+        # Cluster them geographically so each Float vehicle gets a compact area.
+        zone_vehicle_zones = {
+            str(v["zone"]).strip()
+            for v in veh_list
+            if str(v["zone"]).strip().lower() not in ("float", "none", "", "nan")
+        }
+        float_vehicles = [
+            (v_idx, v) for v_idx, v in enumerate(veh_list)
+            if str(v["zone"]).strip().lower() in ("float", "none", "", "nan")
+        ]
+
+        # Stops not claimed by any zone vehicle
+        unowned_stop_indices = [
+            i for i, sz in enumerate(stop_zones)
+            if sz not in zone_vehicle_zones
+        ]
+
+        # Assign each Float vehicle a geographic centre from unowned stops
+        float_centres = {}   # v_idx -> (lat, lon) cluster centre
+        if float_vehicles and unowned_stop_indices:
+            n_floats = len(float_vehicles)
+            # Simple k-means-style cluster assignment for Float vehicle centres
+            # Group unowned stops into n_floats geographic clusters
+            unowned_coords = np.array([
+                [stops_df.iloc[i]["latitude"], stops_df.iloc[i]["longitude"]]
+                for i in unowned_stop_indices
+            ])
+            # Initialise cluster centres spread across the unowned stop set
+            step = max(1, len(unowned_stop_indices) // n_floats)
+            centres = unowned_coords[::step][:n_floats]
+            if len(centres) < n_floats:
+                # Pad with depot if fewer stops than Float vehicles
+                depot_arr = np.array([[config.DEPOT_LAT, config.DEPOT_LON]])
+                while len(centres) < n_floats:
+                    centres = np.vstack([centres, depot_arr])
+
+            # 5-iteration k-means refinement
+            labels = np.zeros(len(unowned_coords), dtype=int)
+            for _ in range(5):
+                dists = np.array([
+                    [haversine_km(c[0], c[1], p[0], p[1])
+                     for c in centres]
+                    for p in unowned_coords
+                ])
+                labels = dists.argmin(axis=1)
+                for k in range(n_floats):
+                    mask = labels == k
+                    if mask.any():
+                        centres[k] = unowned_coords[mask].mean(axis=0)
+
+            # Match Float vehicles to clusters by type compatibility + proximity
+            assigned_clusters = set()
+            for v_idx, vehicle in float_vehicles:
+                vtype      = vehicle["type"]
+                eligible   = [
+                    k for k in range(n_floats)
+                    if k not in assigned_clusters
+                ]
+                if not eligible:
+                    eligible = list(range(n_floats))
+                # Pick the closest unassigned cluster
+                best_k = min(
+                    eligible,
+                    key=lambda k: haversine_km(
+                        centres[k][0], centres[k][1],
+                        config.DEPOT_LAT, config.DEPOT_LON
+                    )
+                )
+                float_centres[v_idx] = (centres[best_k][0], centres[best_k][1])
+                assigned_clusters.add(best_k)
+
+        # ── Build per-vehicle cost callbacks ──────────────────────────────────
         for v_idx, vehicle in enumerate(veh_list):
             vzone    = str(vehicle["zone"]).strip()
             is_float = vzone.lower() in ("float", "none", "", "nan")
 
-            if is_float:
-                # Float vehicles: no zone preference, use standard distance
+            if is_float and v_idx in float_centres:
+                # Float with assigned cluster centre: apply half-penalty for stops
+                # far from its cluster centre (distance-based, not zone-name-based)
+                clat, clon = float_centres[v_idx]
+                def make_float_cb(centre_lat, centre_lon):
+                    def cb(from_idx, to_idx):
+                        j = manager.IndexToNode(to_idx)
+                        d = dist_matrix[manager.IndexToNode(from_idx)][j]
+                        if 0 < j <= len(stops_df):
+                            slat = stops_df.iloc[j - 1]["latitude"]
+                            slon = stops_df.iloc[j - 1]["longitude"]
+                            dist_from_centre = haversine_km(centre_lat, centre_lon,
+                                                            slat, slon)
+                            # Penalty scales with distance from cluster centre
+                            # Stops within 3 km: no penalty
+                            # Stops beyond 3 km: up to float_penalty_m extra
+                            if dist_from_centre > 3.0:
+                                extra = min(
+                                    int((dist_from_centre - 3.0) * 1_000),
+                                    float_penalty_m
+                                )
+                                d += extra
+                        return d
+                    return cb
+                float_cb_idx = routing.RegisterTransitCallback(
+                    make_float_cb(clat, clon)
+                )
+                routing.SetArcCostEvaluatorOfVehicle(float_cb_idx, v_idx)
+            elif is_float:
+                # Float with no cluster (not enough unowned stops): pure distance
                 routing.SetArcCostEvaluatorOfVehicle(dist_cb_idx, v_idx)
             else:
                 def make_zone_cb(v_zone):

@@ -25,7 +25,7 @@ MAX_DRIVER_HOURS = 10
 AVERAGE_SPEED_KMH  = 40
 ROAD_FACTOR        = 1.3
 AVG_SERVICE_MIN    = 12
-SOLVER_TIME_LIMIT_SECONDS = 300
+SOLVER_TIME_LIMIT_SECONDS = 480
 
 # â”€â”€ Zone affinity (SMART mode) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 # Penalty when solver assigns a stop outside its home vehicle zone.

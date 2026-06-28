@@ -36,12 +36,14 @@ st.markdown("""
   div[data-testid="metric-container"] {
     background: #f8f9fa; border-radius: 8px; padding: 8px;
   }
-  /* Hide Streamlit toolbar (share, star, edit, github icons) */
-  header[data-testid="stHeader"] { display: none; }
+  /* Hide Streamlit toolbar icons but keep the sidebar toggle arrow */
   #MainMenu { visibility: hidden; }
   footer { visibility: hidden; }
   div[data-testid="stToolbar"] { display: none; }
   div[data-testid="stDecoration"] { display: none; }
+  /* Hide the top-right action buttons (share, star, github, edit) */
+  div[data-testid="stActionButtonIcon"] { display: none; }
+  button[data-testid="baseButton-headerNoPadding"] { display: none; }
 </style>
 """, unsafe_allow_html=True)
 

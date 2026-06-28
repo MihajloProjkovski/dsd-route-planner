@@ -26,7 +26,7 @@ st.set_page_config(
     page_title="DSD Route Planner",
     page_icon="🚛",
     layout="wide",
-    initial_sidebar_state="expanded",
+    initial_sidebar_state="auto",
 )
 
 st.markdown("""
@@ -36,14 +36,12 @@ st.markdown("""
   div[data-testid="metric-container"] {
     background: #f8f9fa; border-radius: 8px; padding: 8px;
   }
-  /* Hide Streamlit toolbar icons but keep the sidebar toggle arrow */
+  /* Hide only the top-right action buttons, keep sidebar toggle intact */
   #MainMenu { visibility: hidden; }
   footer { visibility: hidden; }
-  div[data-testid="stToolbar"] { display: none; }
+  /* Target the deploy/share/star buttons specifically */
+  .stDeployButton { display: none; }
   div[data-testid="stDecoration"] { display: none; }
-  /* Hide the top-right action buttons (share, star, github, edit) */
-  div[data-testid="stActionButtonIcon"] { display: none; }
-  button[data-testid="baseButton-headerNoPadding"] { display: none; }
 </style>
 """, unsafe_allow_html=True)
 

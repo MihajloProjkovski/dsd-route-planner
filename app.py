@@ -21,6 +21,9 @@ if ROOT not in sys.path:
 
 import config
 import route_planner as rp
+import fleet_registry as fr
+
+FLEET_FILE = "_setup/fleet.xlsx"
 
 st.set_page_config(
     page_title="DSD Route Planner",
@@ -302,8 +305,9 @@ elif page == "⚙️ Admin":
         st.rerun()
     st.markdown("---")
 
-    tab_master, tab_customer, tab_fleet, tab_cfg = st.tabs([
-        "📋 Customer Master", "➕ New Customer", "🚛 Fleet & Zones", "⚙️ Configuration"])
+    tab_master, tab_customer, tab_fleet, tab_zonebuilder, tab_cfg = st.tabs([
+        "📋 Customer Master", "➕ New Customer", "🚛 Fleet Registry",
+        "🗺 Zone Builder", "⚙️ Configuration"])
 
     with tab_master:
         st.subheader("Customer Master")
@@ -418,6 +422,242 @@ elif page == "⚙️ Admin":
                         st.dataframe(zsum, use_container_width=True, hide_index=True, height=260)
             except Exception as e:
                 st.warning(f"Could not load zone summary: {e}")
+
+    with tab_zonebuilder:
+        st.subheader("Zone Builder")
+        st.markdown(
+            "Upload historical delivery data and your fleet is read from the Fleet Registry. "
+            "The model will automatically assign each customer to a geographically compact, "
+            "workload-balanced zone named after your vehicles."
+        )
+        st.markdown("---")
+
+        # Fleet status
+        fleet_ok = os.path.exists(FLEET_FILE)
+        if fleet_ok:
+            try:
+                fl_df = pd.read_excel(FLEET_FILE, sheet_name="Fleet")
+                fl_df = fl_df.dropna(subset=["vehicle_name"])
+                fl_df = fl_df[fl_df["vehicle_name"].astype(str).str.len() > 2]
+                fl_df = fl_df[~fl_df["vehicle_name"].astype(str).str.startswith("HOW")]
+                k = (fl_df["vehicle_type"]=="Kamion").sum()
+                f = (fl_df["vehicle_type"]=="Furgon").sum()
+                v = (fl_df["vehicle_type"]=="Van").sum()
+                st.success(f"✅ Fleet Registry loaded: {k} Kamion · {f} Furgon · {v} Van ({len(fl_df)} total)")
+            except Exception as e:
+                fleet_ok = False
+                st.warning(f"Could not read fleet.xlsx: {e}")
+        else:
+            st.warning("No fleet.xlsx found. Go to the Fleet Registry tab to define your fleet first.")
+
+        # History upload
+        hist_file = st.file_uploader(
+            "Upload historical delivery file",
+            type=["xlsx"],
+            help="Required columns: Delivery Date, Customer Code, Customer Name, "
+                 "Latitude, Longitude, Total Weight, Vehicle Type"
+        )
+
+        master_file = st.file_uploader(
+            "Upload existing customer master (optional — used to preserve non-zone data)",
+            type=["xlsx"], key="zb_master"
+        )
+
+        if hist_file and fleet_ok:
+            if st.button("🗺  Build Zones", type="primary"):
+                with st.spinner("Clustering customers into zones... (may take 30–60s)"):
+                    try:
+                        hist_df   = pd.read_excel(io.BytesIO(hist_file.getvalue()))
+                        master_df = None
+                        if master_file:
+                            try:
+                                master_df = pd.read_excel(
+                                    io.BytesIO(master_file.getvalue()),
+                                    sheet_name="Customers"
+                                )
+                            except Exception:
+                                pass
+
+                        updated, zone_summary, map_html = fr.build_zones(
+                            hist_df, fl_df, master_df
+                        )
+                        st.session_state.update({
+                            "zb_updated":   updated,
+                            "zb_summary":   zone_summary,
+                            "zb_map":       map_html,
+                        })
+                    except Exception as e:
+                        st.error(f"Zone building failed: {e}")
+
+        if "zb_updated" in st.session_state:
+            updated      = st.session_state["zb_updated"]
+            zone_summary = st.session_state["zb_summary"]
+            map_html     = st.session_state["zb_map"]
+
+            st.markdown("---")
+            st.success(f"✅ Zones built for **{len(updated):,}** customers across **{len(zone_summary)}** zones.")
+
+            # Download updated master
+            buf = io.BytesIO()
+            import openpyxl as _opx
+            wb_out = _opx.Workbook()
+            ws_out = wb_out.active
+            ws_out.title = "Customers"
+            cols_out = list(updated.columns)
+            ws_out.append(cols_out)
+            for _, row in updated.iterrows():
+                ws_out.append([row[c] for c in cols_out])
+            wb_out.save(buf)
+            buf.seek(0)
+            st.download_button(
+                "⬇  Download updated customer_master.xlsx",
+                buf.getvalue(),
+                file_name="customer_master.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                type="primary",
+            )
+
+            # Validation table
+            st.markdown("#### Zone Validation Summary")
+            st.caption("✅ OK  🟡 Heavy (>70% utilisation)  ⚠️ Overloaded (>90%)  💤 Very light")
+            df_sum = pd.DataFrame(zone_summary)[[
+                "zone","vehicle_type","customers",
+                "exp_daily_stops","exp_daily_kg",
+                "trip_capacity_kg","utilisation_pct","flag"
+            ]].copy()
+            df_sum.columns = [
+                "Zone","Type","Customers",
+                "Exp Stops/Day","Exp KG/Day",
+                "Trip Cap (kg)","Utilisation %","Status"
+            ]
+
+            def _zb_color(row):
+                if "OVER" in str(row["Status"]):
+                    return ["background-color:#fdd"]*len(row)
+                if "Heavy" in str(row["Status"]):
+                    return ["background-color:#fff9c4"]*len(row)
+                if "light" in str(row["Status"]):
+                    return ["background-color:#d4eaf7"]*len(row)
+                return [""]*len(row)
+
+            st.dataframe(
+                df_sum.style.apply(_zb_color, axis=1),
+                use_container_width=True, hide_index=True, height=400
+            )
+
+            # Interactive map
+            st.markdown("#### Interactive Zone Map")
+            st.caption("Filter by vehicle type or zone in the map sidebar. Summary table is shown below the map.")
+            components.html(map_html, height=600, scrolling=False)
+
+            if st.button("🗑  Clear Results"):
+                for k in ["zb_updated","zb_summary","zb_map"]:
+                    st.session_state.pop(k, None)
+                st.rerun()
+
+    with tab_fleet:
+        st.subheader("Fleet Registry")
+        st.markdown(
+            "Define your fleet here once. This is the source of truth used by the Zone Builder "
+            "and for generating the `today.xlsx` template."
+        )
+
+        col_up, col_dn = st.columns(2)
+        with col_up:
+            st.markdown("**Upload / Replace Fleet Registry**")
+            new_fl = st.file_uploader("Upload fleet.xlsx", type=["xlsx"], key="fleet_up")
+            if new_fl and st.button("✅ Replace Fleet Registry", type="primary"):
+                os.makedirs("_setup", exist_ok=True)
+                with open(FLEET_FILE, "wb") as f:
+                    f.write(new_fl.getvalue())
+                st.success("Fleet registry replaced.")
+                st.rerun()
+
+        with col_dn:
+            st.markdown("**Download Current Fleet Registry**")
+            if os.path.exists(FLEET_FILE):
+                with open(FLEET_FILE, "rb") as f:
+                    st.download_button("⬇ Download fleet.xlsx", f.read(),
+                                       "fleet.xlsx", use_container_width=True)
+
+        st.markdown("---")
+
+        # Show current fleet with inline editing
+        if os.path.exists(FLEET_FILE):
+            try:
+                fl_edit = pd.read_excel(FLEET_FILE, sheet_name="Fleet")
+                fl_edit = fl_edit.dropna(subset=["vehicle_name"])
+                fl_edit = fl_edit[fl_edit["vehicle_name"].astype(str).str.len() > 2]
+                fl_edit = fl_edit[~fl_edit["vehicle_name"].astype(str).str.startswith("HOW")]
+                fl_show = fl_edit[["vehicle_name","vehicle_type","capacity_kg","max_trips_per_day","notes"]].copy()
+                fl_show.columns = ["Vehicle Name","Type","Capacity/Trip (kg)","Max Trips/Day","Notes"]
+
+                c1,c2,c3 = st.columns(3)
+                c1.metric("Kamion", (fl_edit["vehicle_type"]=="Kamion").sum())
+                c2.metric("Furgon", (fl_edit["vehicle_type"]=="Furgon").sum())
+                c3.metric("Van",    (fl_edit["vehicle_type"]=="Van").sum())
+
+                st.caption("Edit the table below then click **Save Changes**.")
+                edited = st.data_editor(
+                    fl_show, use_container_width=True, hide_index=True,
+                    num_rows="dynamic",
+                    column_config={
+                        "Type": st.column_config.SelectboxColumn(
+                            options=["Kamion","Furgon","Van"], required=True
+                        ),
+                        "Capacity/Trip (kg)": st.column_config.NumberColumn(
+                            min_value=100, max_value=30_000, step=100
+                        ),
+                        "Max Trips/Day": st.column_config.NumberColumn(
+                            min_value=1, max_value=5, step=1
+                        ),
+                    }
+                )
+                if st.button("💾 Save Changes", type="primary"):
+                    import openpyxl as _opx2
+                    from openpyxl.styles import PatternFill as _PF, Font as _Fn, Alignment as _Al
+                    _HDR = _PF("solid", fgColor="1F4E79")
+                    _TF  = {"Kamion":_PF("solid",fgColor="D6E4F7"),
+                            "Furgon":_PF("solid",fgColor="D6F7E4"),
+                            "Van":   _PF("solid",fgColor="FFF3CD")}
+                    wb2 = _opx2.Workbook(); ws2 = wb2.active; ws2.title = "Fleet"
+                    hdr = ["vehicle_name","vehicle_type","capacity_kg","max_trips_per_day","notes"]
+                    ws2.append(hdr)
+                    for cell in ws2[1]:
+                        cell.fill = _HDR
+                        cell.font = _Fn(color="FFFFFF", bold=True)
+                        cell.alignment = _Al(horizontal="center")
+                    edited.columns = hdr
+                    for _, row in edited.iterrows():
+                        vt = str(row.get("vehicle_type",""))
+                        ws2.append([row[c] for c in hdr])
+                        if vt in _TF:
+                            for cell in ws2[ws2.max_row]: cell.fill = _TF[vt]
+                    for col_l, w in zip(["A","B","C","D","E"],[22,12,14,18,30]):
+                        ws2.column_dimensions[col_l].width = w
+                    ws2.freeze_panes = "A2"
+                    wb2.save(FLEET_FILE)
+                    st.success("Fleet registry saved.")
+                    st.rerun()
+            except Exception as e:
+                st.error(f"Could not read fleet registry: {e}")
+        else:
+            st.info("No fleet registry yet. Upload one above or download the blank template from below.")
+            st.markdown("**Download Blank Fleet Template**")
+            import openpyxl as _opx3
+            _buf2 = io.BytesIO()
+            _wb3  = _opx3.Workbook(); _ws3 = _wb3.active; _ws3.title = "Fleet"
+            _ws3.append(["vehicle_name","vehicle_type","capacity_kg","max_trips_per_day","notes"])
+            _ws3.append(["Example: DSD 1","Kamion",6000,2,""])
+            _wb3.save(_buf2); _buf2.seek(0)
+            st.download_button("⬇ Download blank fleet.xlsx", _buf2.getvalue(),
+                               "fleet.xlsx", use_container_width=True)
+
+        st.markdown("---")
+        st.markdown("**Download Blank today.xlsx template**")
+        st.download_button("⬇  Download blank today.xlsx",
+                           make_blank_template(), file_name="today.xlsx",
+                           mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 
     with tab_cfg:
         st.subheader("Configuration")

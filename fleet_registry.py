@@ -191,6 +191,11 @@ def build_zones(history_df: pd.DataFrame, fleet_df: pd.DataFrame,
         return np.column_stack([df[["latitude","longitude"]].values, rs * RIVER_WEIGHT])
 
     # Improvements 4 + 5: SA balancing stop CV and weight CV with geographic guard
+    # Fix 1: tightened geographic guard — max 3 km farther than own zone centre
+    # Fix 2: SA only considers K=3 nearest zones per customer (no cross-city moves)
+    _SA_MAX_EXTRA_KM = 3.0   # a move is rejected if target is >3 km farther than own centre
+    _SA_K_NEAREST    = 3     # each customer can only move to one of its K nearest zones
+
     def _sa_balance(sub_df, zone_labels_init, vehicle_names,
                     n_iter=5000, T_start=30.0, cooling=0.9985):
         import math
@@ -201,6 +206,7 @@ def build_zones(history_df: pd.DataFrame, fleet_df: pd.DataFrame,
         ds       = sub_df["daily_freq"].values.astype(float)
         dw       = (sub_df["daily_freq"] * sub_df["avg_weight_kg"]).values.astype(float)
         vn_arr   = np.array(vehicle_names)
+        k_near   = min(_SA_K_NEAREST, len(vehicle_names))
 
         zs   = {vn: 0.0 for vn in vehicle_names}
         zw   = {vn: 0.0 for vn in vehicle_names}
@@ -211,6 +217,21 @@ def build_zones(history_df: pd.DataFrame, fleet_df: pd.DataFrame,
             zs[vn]+=ds[i]; zw[vn]+=dw[i]
             zlat[vn]+=lats_a[i]; zlon[vn]+=lons_a[i]; zcnt[vn]+=1
 
+        def _zone_centre(vn):
+            c = zcnt[vn]
+            return (zlat[vn]/c, zlon[vn]/c) if c > 0 else (DEPOT_LAT, DEPOT_LON)
+
+        def _nearest_zones(i):
+            """Return K nearest vehicle names to customer i (excluding own zone)."""
+            own_z = labels[i]
+            dists = []
+            for vn in vehicle_names:
+                if vn == own_z: continue
+                clat, clon = _zone_centre(vn)
+                dists.append((haversine_km(lats_a[i], lons_a[i], clat, clon), vn))
+            dists.sort(key=lambda x: x[0])
+            return [vn for _, vn in dists[:k_near]]
+
         def _E():
             sv = np.array([zs[vn] for vn in vehicle_names])
             wv = np.array([zw[vn] for vn in vehicle_names])
@@ -220,14 +241,18 @@ def build_zones(history_df: pd.DataFrame, fleet_df: pd.DataFrame,
         for _ in range(n_iter):
             i     = np.random.randint(n)
             old_z = labels[i]
-            new_z = vn_arr[np.random.randint(len(vehicle_names))]
-            if new_z == old_z: T*=cooling; continue
-            nc = zcnt[new_z]
-            if nc > 0:
-                d_new = haversine_km(lats_a[i],lons_a[i], zlat[new_z]/nc, zlon[new_z]/nc)
-                oc = zcnt[old_z]
-                d_old = haversine_km(lats_a[i],lons_a[i], zlat[old_z]/oc, zlon[old_z]/oc) if oc>0 else 0
-                if d_new > max(d_old*2.5, 8.0): T*=cooling; continue
+
+            # Fix 2: only pick from K nearest zones
+            candidates = _nearest_zones(i)
+            if not candidates: T*=cooling; continue
+            new_z = candidates[np.random.randint(len(candidates))]
+
+            # Fix 1: tightened geographic guard
+            oc = zcnt[old_z]
+            d_old = haversine_km(lats_a[i],lons_a[i], *_zone_centre(old_z)) if oc > 0 else 0
+            d_new = haversine_km(lats_a[i],lons_a[i], *_zone_centre(new_z))
+            if d_new > d_old + _SA_MAX_EXTRA_KM: T*=cooling; continue
+
             zs[old_z]-=ds[i]; zs[new_z]+=ds[i]
             zw[old_z]-=dw[i]; zw[new_z]+=dw[i]
             zlat[old_z]-=lats_a[i]; zlat[new_z]+=lats_a[i]

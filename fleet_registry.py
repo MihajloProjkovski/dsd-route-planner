@@ -110,8 +110,17 @@ def build_zones(history_df: pd.DataFrame, fleet_df: pd.DataFrame,
         name       = grp["Customer Name"].mode().iloc[0] if "Customer Name" in grp.columns else ""
         street     = grp["Street"].mode().iloc[0] if "Street" in grp.columns else ""
         visits     = len(grp)
-        # Expected daily stops: how often this customer orders on average per day
-        daily_freq = visits / n_days
+        # Fix 2: use 75th-percentile daily frequency (peak-day planning)
+        # This balances zones for heavy days, not average days.
+        if "Delivery Date" in grp.columns and len(grp) >= 4:
+            counts_by_date = grp.groupby("Delivery Date").size()
+            daily_freq = float(np.percentile(counts_by_date.reindex(
+                pd.date_range(grp["Delivery Date"].min(),
+                              grp["Delivery Date"].max(), freq="D"),
+                fill_value=0
+            ).values, 75)) / 1.0  # 75th pct of daily orders (0 on non-order days included)
+        else:
+            daily_freq = visits / n_days
         return pd.Series({
             "customer_name": name,
             "street":        street,
@@ -233,9 +242,28 @@ def build_zones(history_df: pd.DataFrame, fleet_df: pd.DataFrame,
             return [vn for _, vn in dists[:k_near]]
 
         def _E():
-            sv = np.array([zs[vn] for vn in vehicle_names])
-            wv = np.array([zw[vn] for vn in vehicle_names])
-            return 0.5*(sv.std()/max(sv.mean(),1e-9)) + 0.5*(wv.std()/max(wv.mean(),1e-9))
+            # Fix 1+3: compute CV per-type, average across types
+            # This prevents inter-type imbalance from inflating the energy function.
+            type_cvs_s = []
+            type_cvs_w = []
+            # group zones by vehicle type via fl_regular lookup
+            vtype_map = {}
+            for vn in vehicle_names:
+                rows = fl_regular[fl_regular["vehicle_name"] == vn]
+                vtype_map[vn] = rows.iloc[0]["vehicle_type"] if not rows.empty else "?"
+            types_present = set(vtype_map.values())
+            for vt in types_present:
+                vns_t = [vn for vn, vt2 in vtype_map.items() if vt2 == vt]
+                if len(vns_t) < 2: continue
+                sv = np.array([zs[vn] for vn in vns_t])
+                wv = np.array([zw[vn] for vn in vns_t])
+                type_cvs_s.append(sv.std() / max(sv.mean(), 1e-9))
+                type_cvs_w.append(wv.std() / max(wv.mean(), 1e-9))
+            if not type_cvs_s:
+                sv = np.array([zs[vn] for vn in vehicle_names])
+                wv = np.array([zw[vn] for vn in vehicle_names])
+                return 0.5*(sv.std()/max(sv.mean(),1e-9)) + 0.5*(wv.std()/max(wv.mean(),1e-9))
+            return 0.5*float(np.mean(type_cvs_s)) + 0.5*float(np.mean(type_cvs_w))
 
         T = T_start; E = _E(); best_labels = labels.copy(); best_E = E
         for _ in range(n_iter):
@@ -439,11 +467,23 @@ def build_zones(history_df: pd.DataFrame, fleet_df: pd.DataFrame,
     # ── 8. Build interactive map ───────────────────────────────────────────────
     map_html = _build_zone_map(cust_zoned, zone_summary, fl)
 
-    # ── Improvement 6: Zone quality score ─────────────────────────────────────
-    stops_arr  = np.array([z["exp_daily_stops"] for z in zone_summary])
-    weight_arr = np.array([z["exp_daily_kg"]    for z in zone_summary])
-    stop_cv    = stops_arr.std()  / max(stops_arr.mean(),  1e-9)
-    weight_cv  = weight_arr.std() / max(weight_arr.mean(), 1e-9)
+    # ── Improvement 6: Zone quality score (Fix 1: per-type CV) ─────────────────
+    # Build per-type stop and weight arrays
+    type_stop_cvs   = []
+    type_weight_cvs = []
+    zone_types = {z["zone"]: z["vehicle_type"] for z in zone_summary}
+    all_vtypes = set(zone_types.values())
+    for vt in all_vtypes:
+        vt_zones = [z for z in zone_summary if z["vehicle_type"] == vt]
+        if len(vt_zones) < 2:
+            continue
+        sv = np.array([z["exp_daily_stops"] for z in vt_zones])
+        wv = np.array([z["exp_daily_kg"]    for z in vt_zones])
+        type_stop_cvs.append(sv.std()  / max(sv.mean(),  1e-9))
+        type_weight_cvs.append(wv.std() / max(wv.mean(), 1e-9))
+
+    stop_cv   = float(np.mean(type_stop_cvs))   if type_stop_cvs   else 1.0
+    weight_cv = float(np.mean(type_weight_cvs)) if type_weight_cvs else 1.0
 
     # Average intra-zone distance from centre
     compactness_vals = []

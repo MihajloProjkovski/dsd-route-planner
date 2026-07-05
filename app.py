@@ -478,13 +478,14 @@ elif page == "⚙️ Admin":
                             except Exception:
                                 pass
 
-                        updated, zone_summary, map_html = fr.build_zones(
+                        updated, zone_summary, map_html, quality = fr.build_zones(
                             hist_df, fl_df, master_df
                         )
                         st.session_state.update({
                             "zb_updated":   updated,
                             "zb_summary":   zone_summary,
                             "zb_map":       map_html,
+                            "zb_quality":   quality,
                         })
                     except Exception as e:
                         st.error(f"Zone building failed: {e}")
@@ -496,6 +497,19 @@ elif page == "⚙️ Admin":
 
             st.markdown("---")
             st.success(f"✅ Zones built for **{len(updated):,}** customers across **{len(zone_summary)}** zones.")
+
+            # Quality score
+            q = st.session_state.get("zb_quality", {})
+            if q:
+                qc1, qc2, qc3, qc4 = st.columns(4)
+                qc1.metric("🏆 Composite Score", f"{q.get('composite_score',0)}/100",
+                           help="Overall zone quality: balance + compactness")
+                qc2.metric("⚖️ Stop Balance", f"{q.get('stop_score',0)}/100",
+                           help=f"CV={q.get('stop_balance_cv',0):.3f} — lower CV = more equal daily stops")
+                qc3.metric("📦 Weight Balance", f"{q.get('weight_score',0)}/100",
+                           help=f"CV={q.get('weight_balance_cv',0):.3f} — lower CV = more equal daily weight")
+                qc4.metric("📍 Compactness", f"{q.get('compactness_score',0)}/100",
+                           help=f"Avg {q.get('avg_compactness_km',0):.1f} km intra-zone radius")
 
             # Download updated master
             buf = io.BytesIO()

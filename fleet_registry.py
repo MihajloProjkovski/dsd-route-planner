@@ -82,6 +82,7 @@ def build_zones(history_df: pd.DataFrame, fleet_df: pd.DataFrame,
     updated_master : pd.DataFrame with zone column assigned
     zone_summary   : list of dicts for validation table
     map_html       : str HTML of interactive Leaflet map
+    quality        : dict of zone quality metrics (composite score 0-100)
     """
     global _DATASET_DAYS
 
@@ -156,160 +157,137 @@ def build_zones(history_df: pd.DataFrame, fleet_df: pd.DataFrame,
     # Count vehicles per type for clustering
     type_counts = fl_regular.groupby("vehicle_type")["vehicle_name"].apply(list).to_dict()
 
-    # ── 5. Improved clustering: geography-first, then workload balance ─────────
+    # ── 5. Six-improvement clustering algorithm ────────────────────────────────
     #
-    # Stage 1: Cluster HIGH-VISIT customers (≥5 visits) by geography only.
-    #          These establish stable, compact geographic zones.
-    # Stage 2: Assign LOW-VISIT customers (<5 visits) to nearest zone centre.
-    #          They don't anchor zones but still get geographic placement.
-    # Stage 3: Workload rebalancing — iteratively move boundary customers
-    #          from overloaded zones to underloaded neighbours until
-    #          zone workloads are within ±30% of the fleet average per type.
+    # #1  Data-driven anchor threshold (25th percentile of visits)
+    # #2  Vardar river barrier as a feature dimension
+    # #3  KMeans(weighted anchors) or AgglomerativeClustering(Ward) hybrid
+    # #4  Separate stop-count AND weight objectives
+    # #5  Simulated annealing Stage 3 with geographic constraint
+    # #6  Zone quality score returned alongside summary
 
-    MIN_ANCHOR_VISITS = 5           # customers with fewer visits don't anchor zones
-    BALANCE_TOLERANCE = 0.30        # allow ±30% of average workload
+    from sklearn.cluster import AgglomerativeClustering
 
     cust["workload_score"] = cust["daily_freq"] * cust["avg_weight_kg"]
     cust["zone"] = None
 
-    def cluster_type_improved(sub_df, vehicle_names):
+    # Improvement 1: data-driven anchor threshold
+    ANCHOR_THRESHOLD  = max(3, int(np.percentile(cust["visits"].values, 25)))
+    BALANCE_TOLERANCE = 0.30
+
+    # Improvement 2: Vardar river barrier
+    RIVER_LAT      = 42.002
+    RIVER_LON_WEST = 21.37
+    RIVER_LON_EAST = 21.52
+    RIVER_WEIGHT   = 0.12   # ~13 km equivalent; makes cross-river clustering costly
+
+    def _river_side(lat, lon):
+        if RIVER_LON_WEST <= lon <= RIVER_LON_EAST:
+            return 1.0 if lat >= RIVER_LAT else 0.0
+        return 0.5
+
+    def _make_features(df):
+        rs = df.apply(lambda r: _river_side(r["latitude"], r["longitude"]), axis=1).values
+        return np.column_stack([df[["latitude","longitude"]].values, rs * RIVER_WEIGHT])
+
+    # Improvements 4 + 5: SA balancing stop CV and weight CV with geographic guard
+    def _sa_balance(sub_df, zone_labels_init, vehicle_names,
+                    n_iter=5000, T_start=30.0, cooling=0.9985):
+        import math
+        labels   = np.array(zone_labels_init, dtype=object)
+        n        = len(labels)
+        lats_a   = sub_df["latitude"].values
+        lons_a   = sub_df["longitude"].values
+        ds       = sub_df["daily_freq"].values.astype(float)
+        dw       = (sub_df["daily_freq"] * sub_df["avg_weight_kg"]).values.astype(float)
+        vn_arr   = np.array(vehicle_names)
+
+        zs   = {vn: 0.0 for vn in vehicle_names}
+        zw   = {vn: 0.0 for vn in vehicle_names}
+        zlat = {vn: 0.0 for vn in vehicle_names}
+        zlon = {vn: 0.0 for vn in vehicle_names}
+        zcnt = {vn: 0   for vn in vehicle_names}
+        for i, vn in enumerate(labels):
+            zs[vn]+=ds[i]; zw[vn]+=dw[i]
+            zlat[vn]+=lats_a[i]; zlon[vn]+=lons_a[i]; zcnt[vn]+=1
+
+        def _E():
+            sv = np.array([zs[vn] for vn in vehicle_names])
+            wv = np.array([zw[vn] for vn in vehicle_names])
+            return 0.5*(sv.std()/max(sv.mean(),1e-9)) + 0.5*(wv.std()/max(wv.mean(),1e-9))
+
+        T = T_start; E = _E(); best_labels = labels.copy(); best_E = E
+        for _ in range(n_iter):
+            i     = np.random.randint(n)
+            old_z = labels[i]
+            new_z = vn_arr[np.random.randint(len(vehicle_names))]
+            if new_z == old_z: T*=cooling; continue
+            nc = zcnt[new_z]
+            if nc > 0:
+                d_new = haversine_km(lats_a[i],lons_a[i], zlat[new_z]/nc, zlon[new_z]/nc)
+                oc = zcnt[old_z]
+                d_old = haversine_km(lats_a[i],lons_a[i], zlat[old_z]/oc, zlon[old_z]/oc) if oc>0 else 0
+                if d_new > max(d_old*2.5, 8.0): T*=cooling; continue
+            zs[old_z]-=ds[i]; zs[new_z]+=ds[i]
+            zw[old_z]-=dw[i]; zw[new_z]+=dw[i]
+            zlat[old_z]-=lats_a[i]; zlat[new_z]+=lats_a[i]
+            zlon[old_z]-=lons_a[i]; zlon[new_z]+=lons_a[i]
+            zcnt[old_z]-=1; zcnt[new_z]+=1
+            labels[i] = new_z
+            new_E = _E(); dE = new_E - E
+            if dE < 0 or (T>0.01 and np.random.random() < math.exp(-dE/T)):
+                E = new_E
+                if E < best_E: best_E=E; best_labels=labels.copy()
+            else:
+                zs[new_z]-=ds[i]; zs[old_z]+=ds[i]
+                zw[new_z]-=dw[i]; zw[old_z]+=dw[i]
+                zlat[new_z]-=lats_a[i]; zlat[old_z]+=lats_a[i]
+                zlon[new_z]-=lons_a[i]; zlon[old_z]+=lons_a[i]
+                zcnt[new_z]-=1; zcnt[old_z]+=1; labels[i]=old_z
+            T *= cooling
+        return best_labels
+
+    # Improvement 3: hybrid clustering
+    def cluster_type_v2(sub_df, vehicle_names):
         if len(sub_df) == 0 or not vehicle_names:
             return sub_df
 
         n_clust = len(vehicle_names)
-        sub_df  = sub_df.copy().reset_index(drop=True)
+        sub_df  = sub_df.reset_index(drop=True)
 
-        # ── Stage 1: Geographic clustering on anchor customers ────────────────
-        anchors = sub_df[sub_df["visits"] >= MIN_ANCHOR_VISITS]
-        non_anchors = sub_df[sub_df["visits"] < MIN_ANCHOR_VISITS]
+        is_anchor = sub_df["visits"] >= ANCHOR_THRESHOLD
+        n_anchors = int(is_anchor.sum())
 
-        if len(anchors) >= n_clust:
-            # Fit k-means purely on geographic coords of anchor customers
-            # Sample weights proportional to visit count (more visits = stronger anchor)
-            sw = anchors["visits"].values.astype(float)
+        if n_anchors >= n_clust:
+            # Fit KMeans on anchor customers (weighted by visits) + predict all
+            anchor_feats = _make_features(sub_df[is_anchor])
+            sw = sub_df.loc[is_anchor, "visits"].values.astype(float)
             sw = sw / sw.max()
-
             km = KMeans(n_clusters=n_clust, random_state=42, n_init=30, max_iter=500)
-            km.fit(anchors[["latitude", "longitude"]].values, sample_weight=sw)
-            anchor_labels = km.labels_
-            centres       = km.cluster_centers_   # geographic centres
-
-            # Assign non-anchor customers to nearest centre
-            non_anchor_labels = []
-            for _, row in non_anchors.iterrows():
-                dists = [haversine_km(row["latitude"], row["longitude"],
-                                      c[0], c[1]) for c in centres]
-                non_anchor_labels.append(int(np.argmin(dists)))
-
-            # Combine
-            all_labels = np.empty(len(sub_df), dtype=int)
-            all_labels[anchors.index]     = anchor_labels
-            all_labels[non_anchors.index] = non_anchor_labels
-
+            km.fit(anchor_feats, sample_weight=sw)
+            all_cluster_labels = km.predict(_make_features(sub_df))
         else:
-            # Not enough anchors — fall back to pure geographic k-means on all
-            km = KMeans(n_clusters=n_clust, random_state=42, n_init=30, max_iter=500)
-            all_labels = km.fit_predict(sub_df[["latitude", "longitude"]].values)
-            centres    = km.cluster_centers_
+            # AgglomerativeClustering(Ward) on all customers
+            ag = AgglomerativeClustering(n_clusters=n_clust, linkage="ward")
+            all_cluster_labels = ag.fit_predict(_make_features(sub_df))
 
-        # ── Stage 2: Match clusters → vehicles by workload + geography ────────
-        # Compute total workload per cluster
-        cluster_workload = {}
-        cluster_centre   = {}
-        for k in range(n_clust):
-            mask = all_labels == k
-            cluster_workload[k] = float(sub_df.loc[mask, "workload_score"].sum())
-            cluster_centre[k]   = (
-                float(sub_df.loc[mask, "latitude"].mean()),
-                float(sub_df.loc[mask, "longitude"].mean()),
-            ) if mask.any() else (DEPOT_LAT, DEPOT_LON)
-
-        # Sort clusters heaviest-first; sort vehicles highest-daily-cap-first
-        sorted_clusters = sorted(cluster_workload.keys(),
-                                 key=lambda k: -cluster_workload[k])
+        # Match cluster indices → vehicle names by workload capacity
+        cluster_workload = {
+            k: float(sub_df.loc[all_cluster_labels==k, "workload_score"].sum())
+            for k in range(n_clust)
+        }
+        sorted_clusters = sorted(cluster_workload, key=lambda k: -cluster_workload[k])
         sorted_vehicles = sorted(
             vehicle_names,
-            key=lambda vn: -fl_regular[fl_regular["vehicle_name"] == vn]["daily_cap_kg"].values[0]
+            key=lambda vn: -fl_regular[fl_regular["vehicle_name"]==vn]["daily_cap_kg"].values[0]
             if vn in fl_regular["vehicle_name"].values else 0
         )
-        cluster_to_zone = {ci: vn for ci, vn
-                           in zip(sorted_clusters, sorted_vehicles)}
+        cluster_to_zone = {ci: vn for ci, vn in zip(sorted_clusters, sorted_vehicles)}
         zone_labels = np.array([cluster_to_zone.get(l, sorted_vehicles[l % n_clust])
-                                for l in all_labels])
+                                 for l in all_cluster_labels])
 
-        # ── Stage 3: Workload rebalancing ─────────────────────────────────────
-        # Iteratively move customers from overloaded zones to underloaded
-        # neighbours, but only if the customer is geographically close to
-        # the target zone centre (< 3 km further than current zone centre).
-        avg_workload = sub_df["workload_score"].sum() / n_clust
-        lo_thresh    = avg_workload * (1 - BALANCE_TOLERANCE)
-        hi_thresh    = avg_workload * (1 + BALANCE_TOLERANCE)
-
-        # Compute per-zone centre and workload from current assignment
-        def zone_stats():
-            stats = {}
-            for vn in vehicle_names:
-                mask = zone_labels == vn
-                stats[vn] = {
-                    "wl":  float(sub_df.loc[mask, "workload_score"].sum()),
-                    "lat": float(sub_df.loc[mask, "latitude"].mean()) if mask.any() else DEPOT_LAT,
-                    "lon": float(sub_df.loc[mask, "longitude"].mean()) if mask.any() else DEPOT_LON,
-                }
-            return stats
-
-        for _pass in range(10):
-            stats    = zone_stats()
-            changed  = False
-            overloaded   = [vn for vn, s in stats.items() if s["wl"] > hi_thresh]
-            underloaded  = [vn for vn, s in stats.items() if s["wl"] < lo_thresh]
-            if not overloaded or not underloaded:
-                break
-
-            for over_vn in overloaded:
-                s_over  = stats[over_vn]
-                # Candidates: customers in overloaded zone, sorted by distance
-                # to their zone centre (farthest first = most moveable)
-                over_mask     = zone_labels == over_vn
-                candidates    = sub_df[over_mask].copy()
-                candidates["dist_to_own"] = candidates.apply(
-                    lambda r: haversine_km(r["latitude"], r["longitude"],
-                                           s_over["lat"], s_over["lon"]), axis=1
-                )
-                candidates = candidates.sort_values("dist_to_own", ascending=False)
-
-                for _, cand in candidates.iterrows():
-                    if stats.get(over_vn, {}).get("wl", 0) <= hi_thresh:
-                        break   # zone no longer overloaded
-
-                    # Find nearest underloaded zone that is geographically closer
-                    best_under = None
-                    best_gain  = 0
-                    for under_vn in underloaded:
-                        if stats.get(under_vn, {}).get("wl", 0) >= hi_thresh:
-                            continue
-                        s_under = stats[under_vn]
-                        d_under = haversine_km(cand["latitude"], cand["longitude"],
-                                               s_under["lat"], s_under["lon"])
-                        d_over  = haversine_km(cand["latitude"], cand["longitude"],
-                                               s_over["lat"], s_over["lon"])
-                        # Only move if the underloaded zone is not much farther
-                        if d_under <= d_over + 3.0:
-                            gain = stats[over_vn]["wl"] - stats[under_vn]["wl"]
-                            if gain > best_gain:
-                                best_gain  = gain
-                                best_under = under_vn
-
-                    if best_under is not None:
-                        idx = cand.name
-                        zone_labels[idx] = best_under
-                        cand_wl = float(cand["workload_score"])
-                        stats[over_vn]["wl"]  -= cand_wl
-                        stats[best_under]["wl"] += cand_wl
-                        changed = True
-
-            if not changed:
-                break
-
+        # SA: balance stop CV + weight CV simultaneously
+        zone_labels = _sa_balance(sub_df, zone_labels, vehicle_names)
         sub_df["zone"] = zone_labels
         return sub_df
 
@@ -319,7 +297,7 @@ def build_zones(history_df: pd.DataFrame, fleet_df: pd.DataFrame,
         mask = (cust["dom_type"] == vtype) & (cust["special_zone"].isna())
         sub  = cust[mask].copy()
         if len(sub) > 0:
-            parts.append(cluster_type_improved(sub, vnames))
+            parts.append(cluster_type_v2(sub, vnames))
 
     # Customers with no matching vehicle type → assign to nearest cluster centre
     assigned_codes = set()
@@ -436,7 +414,43 @@ def build_zones(history_df: pd.DataFrame, fleet_df: pd.DataFrame,
     # ── 8. Build interactive map ───────────────────────────────────────────────
     map_html = _build_zone_map(cust_zoned, zone_summary, fl)
 
-    return updated, zone_summary, map_html
+    # ── Improvement 6: Zone quality score ─────────────────────────────────────
+    stops_arr  = np.array([z["exp_daily_stops"] for z in zone_summary])
+    weight_arr = np.array([z["exp_daily_kg"]    for z in zone_summary])
+    stop_cv    = stops_arr.std()  / max(stops_arr.mean(),  1e-9)
+    weight_cv  = weight_arr.std() / max(weight_arr.mean(), 1e-9)
+
+    # Average intra-zone distance from centre
+    compactness_vals = []
+    for z in zone_summary:
+        zdf = cust_zoned[cust_zoned["zone"] == z["zone"]]
+        if len(zdf) <= 1:
+            compactness_vals.append(0.0)
+            continue
+        clat, clon = zdf["latitude"].mean(), zdf["longitude"].mean()
+        dists = zdf.apply(
+            lambda r: haversine_km(r["latitude"], r["longitude"], clat, clon), axis=1
+        )
+        compactness_vals.append(float(dists.mean()))
+    avg_compact_km = float(np.mean(compactness_vals)) if compactness_vals else 0.0
+
+    stop_score    = round(max(0.0, 100.0 * (1.0 - stop_cv)),    1)
+    weight_score  = round(max(0.0, 100.0 * (1.0 - weight_cv)),  1)
+    compact_score = round(max(0.0, 100.0 * (1.0 - avg_compact_km / 5.0)), 1)
+    composite     = round(0.40 * stop_score + 0.30 * weight_score + 0.30 * compact_score, 1)
+
+    quality = {
+        "stop_balance_cv":    round(stop_cv,         3),
+        "weight_balance_cv":  round(weight_cv,        3),
+        "avg_compactness_km": round(avg_compact_km,   2),
+        "stop_score":         stop_score,
+        "weight_score":       weight_score,
+        "compactness_score":  compact_score,
+        "composite_score":    composite,
+        "anchor_threshold":   ANCHOR_THRESHOLD,
+    }
+
+    return updated, zone_summary, map_html, quality
 
 
 # ── Map builder ────────────────────────────────────────────────────────────────

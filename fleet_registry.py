@@ -156,76 +156,172 @@ def build_zones(history_df: pd.DataFrame, fleet_df: pd.DataFrame,
     # Count vehicles per type for clustering
     type_counts = fl_regular.groupby("vehicle_type")["vehicle_name"].apply(list).to_dict()
 
-    # ── 5. Weighted k-means clustering per vehicle type ────────────────────────
-    # Features: lat, lon (geographic) + workload_score (frequency × avg_weight)
-    # We scale workload so it contributes meaningfully alongside coords.
+    # ── 5. Improved clustering: geography-first, then workload balance ─────────
+    #
+    # Stage 1: Cluster HIGH-VISIT customers (≥5 visits) by geography only.
+    #          These establish stable, compact geographic zones.
+    # Stage 2: Assign LOW-VISIT customers (<5 visits) to nearest zone centre.
+    #          They don't anchor zones but still get geographic placement.
+    # Stage 3: Workload rebalancing — iteratively move boundary customers
+    #          from overloaded zones to underloaded neighbours until
+    #          zone workloads are within ±30% of the fleet average per type.
+
+    MIN_ANCHOR_VISITS = 5           # customers with fewer visits don't anchor zones
+    BALANCE_TOLERANCE = 0.30        # allow ±30% of average workload
 
     cust["workload_score"] = cust["daily_freq"] * cust["avg_weight_kg"]
     cust["zone"] = None
 
-    def cluster_type(sub_df, vehicle_names, vtype):
+    def cluster_type_improved(sub_df, vehicle_names):
         if len(sub_df) == 0 or not vehicle_names:
             return sub_df
 
-        n_clust  = len(vehicle_names)
-        coords   = sub_df[["latitude", "longitude"]].values
-        workload = sub_df["workload_score"].values
+        n_clust = len(vehicle_names)
+        sub_df  = sub_df.copy().reset_index(drop=True)
 
-        # Normalise workload to roughly same scale as lat/lon differences in Skopje
-        # Typical coord range: ~0.3 degrees lat/lon; workload range varies widely
-        wl_std   = workload.std()
-        wl_scale = 0.05 / wl_std if wl_std > 0 else 0   # 0.05 degrees equivalent
+        # ── Stage 1: Geographic clustering on anchor customers ────────────────
+        anchors = sub_df[sub_df["visits"] >= MIN_ANCHOR_VISITS]
+        non_anchors = sub_df[sub_df["visits"] < MIN_ANCHOR_VISITS]
 
-        # Sample weights: higher-frequency customers anchor clusters more strongly
-        sample_weights = np.clip(sub_df["visits"].values, 1, None).astype(float)
-        sample_weights = sample_weights / sample_weights.max()
+        if len(anchors) >= n_clust:
+            # Fit k-means purely on geographic coords of anchor customers
+            # Sample weights proportional to visit count (more visits = stronger anchor)
+            sw = anchors["visits"].values.astype(float)
+            sw = sw / sw.max()
 
-        features = np.column_stack([
-            coords,
-            workload * wl_scale,
-        ])
+            km = KMeans(n_clusters=n_clust, random_state=42, n_init=30, max_iter=500)
+            km.fit(anchors[["latitude", "longitude"]].values, sample_weight=sw)
+            anchor_labels = km.labels_
+            centres       = km.cluster_centers_   # geographic centres
 
-        km = KMeans(n_clusters=n_clust, random_state=42, n_init=20, max_iter=300)
-        km.fit(features, sample_weight=sample_weights)
-        labels = km.labels_
+            # Assign non-anchor customers to nearest centre
+            non_anchor_labels = []
+            for _, row in non_anchors.iterrows():
+                dists = [haversine_km(row["latitude"], row["longitude"],
+                                      c[0], c[1]) for c in centres]
+                non_anchor_labels.append(int(np.argmin(dists)))
 
-        # ── Match clusters to vehicles by workload balance ────────────────────
-        # Sort clusters by total expected daily workload (descending)
-        # Sort vehicles by daily capacity (descending)
-        # Pair highest-workload cluster → highest-capacity vehicle
+            # Combine
+            all_labels = np.empty(len(sub_df), dtype=int)
+            all_labels[anchors.index]     = anchor_labels
+            all_labels[non_anchors.index] = non_anchor_labels
 
+        else:
+            # Not enough anchors — fall back to pure geographic k-means on all
+            km = KMeans(n_clusters=n_clust, random_state=42, n_init=30, max_iter=500)
+            all_labels = km.fit_predict(sub_df[["latitude", "longitude"]].values)
+            centres    = km.cluster_centers_
+
+        # ── Stage 2: Match clusters → vehicles by workload + geography ────────
+        # Compute total workload per cluster
         cluster_workload = {}
+        cluster_centre   = {}
         for k in range(n_clust):
-            mask = labels == k
-            cluster_workload[k] = sub_df.loc[mask, "workload_score"].sum()
+            mask = all_labels == k
+            cluster_workload[k] = float(sub_df.loc[mask, "workload_score"].sum())
+            cluster_centre[k]   = (
+                float(sub_df.loc[mask, "latitude"].mean()),
+                float(sub_df.loc[mask, "longitude"].mean()),
+            ) if mask.any() else (DEPOT_LAT, DEPOT_LON)
 
+        # Sort clusters heaviest-first; sort vehicles highest-daily-cap-first
         sorted_clusters = sorted(cluster_workload.keys(),
                                  key=lambda k: -cluster_workload[k])
         sorted_vehicles = sorted(
-            range(len(vehicle_names)),
-            key=lambda i: -fl_regular[fl_regular["vehicle_name"] == vehicle_names[i]]["daily_cap_kg"].values[0]
-            if vehicle_names[i] in fl_regular["vehicle_name"].values else 0
+            vehicle_names,
+            key=lambda vn: -fl_regular[fl_regular["vehicle_name"] == vn]["daily_cap_kg"].values[0]
+            if vn in fl_regular["vehicle_name"].values else 0
         )
+        cluster_to_zone = {ci: vn for ci, vn
+                           in zip(sorted_clusters, sorted_vehicles)}
+        zone_labels = np.array([cluster_to_zone.get(l, sorted_vehicles[l % n_clust])
+                                for l in all_labels])
 
-        cluster_to_zone = {}
-        for ci, vi in zip(sorted_clusters, sorted_vehicles):
-            cluster_to_zone[ci] = vehicle_names[vi]
+        # ── Stage 3: Workload rebalancing ─────────────────────────────────────
+        # Iteratively move customers from overloaded zones to underloaded
+        # neighbours, but only if the customer is geographically close to
+        # the target zone centre (< 3 km further than current zone centre).
+        avg_workload = sub_df["workload_score"].sum() / n_clust
+        lo_thresh    = avg_workload * (1 - BALANCE_TOLERANCE)
+        hi_thresh    = avg_workload * (1 + BALANCE_TOLERANCE)
 
-        zone_labels = [cluster_to_zone.get(l, vehicle_names[l % n_clust]) for l in labels]
-        sub_df = sub_df.copy()
+        # Compute per-zone centre and workload from current assignment
+        def zone_stats():
+            stats = {}
+            for vn in vehicle_names:
+                mask = zone_labels == vn
+                stats[vn] = {
+                    "wl":  float(sub_df.loc[mask, "workload_score"].sum()),
+                    "lat": float(sub_df.loc[mask, "latitude"].mean()) if mask.any() else DEPOT_LAT,
+                    "lon": float(sub_df.loc[mask, "longitude"].mean()) if mask.any() else DEPOT_LON,
+                }
+            return stats
+
+        for _pass in range(10):
+            stats    = zone_stats()
+            changed  = False
+            overloaded   = [vn for vn, s in stats.items() if s["wl"] > hi_thresh]
+            underloaded  = [vn for vn, s in stats.items() if s["wl"] < lo_thresh]
+            if not overloaded or not underloaded:
+                break
+
+            for over_vn in overloaded:
+                s_over  = stats[over_vn]
+                # Candidates: customers in overloaded zone, sorted by distance
+                # to their zone centre (farthest first = most moveable)
+                over_mask     = zone_labels == over_vn
+                candidates    = sub_df[over_mask].copy()
+                candidates["dist_to_own"] = candidates.apply(
+                    lambda r: haversine_km(r["latitude"], r["longitude"],
+                                           s_over["lat"], s_over["lon"]), axis=1
+                )
+                candidates = candidates.sort_values("dist_to_own", ascending=False)
+
+                for _, cand in candidates.iterrows():
+                    if stats.get(over_vn, {}).get("wl", 0) <= hi_thresh:
+                        break   # zone no longer overloaded
+
+                    # Find nearest underloaded zone that is geographically closer
+                    best_under = None
+                    best_gain  = 0
+                    for under_vn in underloaded:
+                        if stats.get(under_vn, {}).get("wl", 0) >= hi_thresh:
+                            continue
+                        s_under = stats[under_vn]
+                        d_under = haversine_km(cand["latitude"], cand["longitude"],
+                                               s_under["lat"], s_under["lon"])
+                        d_over  = haversine_km(cand["latitude"], cand["longitude"],
+                                               s_over["lat"], s_over["lon"])
+                        # Only move if the underloaded zone is not much farther
+                        if d_under <= d_over + 3.0:
+                            gain = stats[over_vn]["wl"] - stats[under_vn]["wl"]
+                            if gain > best_gain:
+                                best_gain  = gain
+                                best_under = under_vn
+
+                    if best_under is not None:
+                        idx = cand.name
+                        zone_labels[idx] = best_under
+                        cand_wl = float(cand["workload_score"])
+                        stats[over_vn]["wl"]  -= cand_wl
+                        stats[best_under]["wl"] += cand_wl
+                        changed = True
+
+            if not changed:
+                break
+
         sub_df["zone"] = zone_labels
         return sub_df
 
     # Cluster each vehicle type separately
     parts = []
     for vtype, vnames in type_counts.items():
-        # Customers whose dominant type matches, excluding special zones
         mask = (cust["dom_type"] == vtype) & (cust["special_zone"].isna())
         sub  = cust[mask].copy()
         if len(sub) > 0:
-            parts.append(cluster_type(sub, vnames, vtype))
+            parts.append(cluster_type_improved(sub, vnames))
 
-    # Customers with no matching vehicle type → assign to nearest zone vehicle
+    # Customers with no matching vehicle type → assign to nearest cluster centre
     assigned_codes = set()
     for p in parts:
         assigned_codes.update(p["customer_code"].tolist())
@@ -233,19 +329,34 @@ def build_zones(history_df: pd.DataFrame, fleet_df: pd.DataFrame,
     unmatched = cust[~cust["customer_code"].isin(assigned_codes) &
                      cust["special_zone"].isna()].copy()
     if len(unmatched) > 0:
-        # Assign to nearest cluster centre across all types
-        all_vnames = [v for vnames in type_counts.values() for v in vnames]
-        if all_vnames:
-            unmatched["zone"] = all_vnames[0]  # fallback to first vehicle
+        # Build all zone centres from already-clustered parts
+        all_centres = []
+        for p in parts:
+            for z in p["zone"].dropna().unique():
+                zm = p[p["zone"] == z]
+                all_centres.append({
+                    "zone": z,
+                    "lat":  zm["latitude"].mean(),
+                    "lon":  zm["longitude"].mean(),
+                })
+        if all_centres:
+            for i, row in unmatched.iterrows():
+                nearest = min(all_centres,
+                              key=lambda c: haversine_km(row["latitude"], row["longitude"],
+                                                         c["lat"], c["lon"]))
+                unmatched.at[i, "zone"] = nearest["zone"]
+        else:
+            all_vnames = [v for vnames in type_counts.values() for v in vnames]
+            if all_vnames:
+                unmatched["zone"] = all_vnames[0]
         parts.append(unmatched)
 
     # Special zone customers
     spec_part = cust[cust["special_zone"].notna()].copy()
     for _, row in spec_part.iterrows():
-        sz = row["special_zone"]
+        sz    = row["special_zone"]
         ptype = SPECIAL_ZONES[sz].get("primary_vehicle", "Van") if sz in SPECIAL_ZONES else "Van"
-        # Find vehicle assigned to special zone
-        spec_veh = fl[fl["vehicle_type"] == ptype].head(1)
+        spec_veh  = fl[fl["vehicle_type"] == ptype].head(1)
         zone_name = spec_veh.iloc[0]["vehicle_name"] if not spec_veh.empty else sz
         spec_part.loc[spec_part["customer_code"] == row["customer_code"], "zone"] = zone_name
 

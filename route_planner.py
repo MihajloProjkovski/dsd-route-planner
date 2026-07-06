@@ -675,6 +675,17 @@ def solve_territory(stops_df, vehicles_df):
         else:
             unzoned_recs.append(rec)
 
+    # ── Reclassify idle zone vehicles as Float ────────────────────────────────
+    # A vehicle whose zone has zero orders today is idle. Rather than leaving
+    # it unused, move it to the Float pool so it can absorb unzoned/overflow
+    # stops — eliminating unassigned deliveries that could otherwise be served.
+    idle_zones = [z for z, stops in zone_stops.items() if len(stops) == 0]
+    for z in idle_zones:
+        veh = zone_to_veh.pop(z)
+        float_vehs[veh["vehicle_name"]] = veh
+        float_stops[veh["vehicle_name"]] = []
+        del zone_stops[z]
+
     original_counts = {z: len(zone_stops.get(z, [])) for z in zone_to_veh}
     rebalance_notes = {}
 

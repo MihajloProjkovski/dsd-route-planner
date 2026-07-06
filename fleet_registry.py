@@ -111,22 +111,40 @@ def build_zones(history_df: pd.DataFrame, fleet_df: pd.DataFrame,
         street     = grp["Street"].mode().iloc[0] if "Street" in grp.columns else ""
         visits     = len(grp)
         # Improvement #1: use distinct delivery days as frequency weight.
-        # A customer on 30 rows but only 15 distinct delivery dates should count
-        # as 15 deliveries, not 30. This prevents multi-line shipments from
-        # overweighting a customer's contribution to zone workload.
         if "Delivery Date" in grp.columns:
             distinct_days = grp["Delivery Date"].nunique()
         else:
             distinct_days = visits
+
+        # Mean daily frequency (used for expected daily stops display)
         daily_freq = distinct_days / n_days
+
+        # P75 daily frequency — dynamic zone sizing.
+        # Zones are sized so that p75 demand (a busy day, happens 1-in-4)
+        # fills the vehicle to target capacity, not the average day.
+        # This means zones are smaller (fewer customers) but handle peak demand
+        # without overflow. Average days will look "light" — that's intentional.
+        if "Delivery Date" in grp.columns and distinct_days >= 4:
+            # Build a daily series: 1 for each day the customer ordered, 0 otherwise
+            all_dates  = pd.date_range(grp["Delivery Date"].min(),
+                                       grp["Delivery Date"].max(), freq="D")
+            order_days = set(grp["Delivery Date"].dt.date)
+            daily_series = np.array([1 if d.date() in order_days else 0
+                                     for d in all_dates], dtype=float)
+            p75_freq = float(np.percentile(daily_series, 75)) if len(daily_series) > 0 else daily_freq
+        else:
+            # For customers with very few visits, fall back to a scaled mean
+            # (equivalent to assuming they order on ~75% of their typical cadence)
+            p75_freq = daily_freq * 0.75
         return pd.Series({
             "customer_name": name,
             "street":        street,
             "latitude":      grp["Latitude"].median(),
             "longitude":     grp["Longitude"].median(),
-            "visits":        distinct_days,   # distinct delivery days (not raw row count)
-            "total_rows":    visits,          # total rows in history (kept for reference)
-            "daily_freq":    daily_freq,
+            "visits":        distinct_days,
+            "total_rows":    visits,
+            "daily_freq":    daily_freq,      # mean — for display in validation table
+            "p75_freq":      p75_freq,        # p75 — used for workload-balanced sizing
             "avg_weight_kg": round(float(avg_wt), 1),
             "dom_type":      dom_type,
         })
@@ -176,7 +194,10 @@ def build_zones(history_df: pd.DataFrame, fleet_df: pd.DataFrame,
 
     from sklearn.cluster import AgglomerativeClustering
 
-    cust["workload_score"] = cust["daily_freq"] * cust["avg_weight_kg"]
+    # Use p75_freq for workload_score — zones sized for busy days, not average days.
+    # This means each zone will have fewer customers (sized for ~p75 demand),
+    # leaving buffer capacity for peak days so fewer stops go unassigned.
+    cust["workload_score"] = cust["p75_freq"] * cust["avg_weight_kg"]
     cust["zone"] = None
 
     # Improvement 1: data-driven anchor threshold
@@ -211,7 +232,7 @@ def build_zones(history_df: pd.DataFrame, fleet_df: pd.DataFrame,
         n        = len(labels)
         lats_a   = sub_df["latitude"].values
         lons_a   = sub_df["longitude"].values
-        ds       = sub_df["daily_freq"].values.astype(float)
+        ds       = sub_df["p75_freq"].values.astype(float)   # p75 demand for sizing
         dw       = (sub_df["daily_freq"] * sub_df["avg_weight_kg"]).values.astype(float)
         vn_arr   = np.array(vehicle_names)
         k_near   = min(_SA_K_NEAREST, len(vehicle_names))
@@ -400,10 +421,13 @@ def build_zones(history_df: pd.DataFrame, fleet_df: pd.DataFrame,
     for zone_name in sorted(cust_zoned["zone"].dropna().unique()):
         zdf    = cust_zoned[cust_zoned["zone"] == zone_name]
         n_cust = len(zdf)
-        exp_daily_stops  = zdf["daily_freq"].sum()          # expected stops/day
+        # Mean expected stops (average day)
+        exp_daily_stops  = zdf["daily_freq"].sum()
         exp_daily_weight = (zdf["daily_freq"] * zdf["avg_weight_kg"]).sum()
+        # P75 expected stops (busy day) — used for utilisation flag
+        p75_daily_stops  = zdf["p75_freq"].sum()
+        p75_daily_weight = (zdf["p75_freq"] * zdf["avg_weight_kg"]).sum()
 
-        # Find vehicle capacity
         veh_row = fl[fl["vehicle_name"] == zone_name]
         if not veh_row.empty:
             trip_cap  = veh_row.iloc[0]["capacity_kg"]
@@ -414,12 +438,12 @@ def build_zones(history_df: pd.DataFrame, fleet_df: pd.DataFrame,
             daily_cap = 0
             vtype     = "?"
 
-        # Flag if expected daily weight exceeds daily capacity
-        utilisation = exp_daily_weight / daily_cap * 100 if daily_cap > 0 else 0
+        # Utilisation based on p75 demand — flags zones that overflow on busy days
+        utilisation = p75_daily_weight / daily_cap * 100 if daily_cap > 0 else 0
         if utilisation > 90:
-            flag = "⚠️ OVERLOADED — consider splitting"
+            flag = "⚠️ OVERLOADED on busy days — consider splitting"
         elif utilisation > 70:
-            flag = "🟡 Heavy"
+            flag = "🟡 Heavy on busy days"
         elif exp_daily_stops < 1:
             flag = "💤 Very light — consider merging"
         else:
@@ -430,7 +454,9 @@ def build_zones(history_df: pd.DataFrame, fleet_df: pd.DataFrame,
             "vehicle_type":      vtype,
             "customers":         n_cust,
             "exp_daily_stops":   round(exp_daily_stops, 1),
+            "p75_daily_stops":   round(p75_daily_stops, 1),
             "exp_daily_kg":      round(exp_daily_weight, 0),
+            "p75_daily_kg":      round(p75_daily_weight, 0),
             "trip_capacity_kg":  trip_cap,
             "daily_capacity_kg": daily_cap,
             "utilisation_pct":   round(utilisation, 1),
@@ -580,7 +606,7 @@ def _build_zone_map(cust_df: pd.DataFrame, zone_summary: list,
             f"<td>{z['zone']}</td>"
             f"<td>{z['vehicle_type']}</td>"
             f"<td>{z['customers']}</td>"
-            f"<td>{z['exp_daily_stops']}</td>"
+            f"<td>{z['exp_daily_stops']} / <b>{z['p75_daily_stops']}</b></td>"
             f"<td>{z['exp_daily_kg']:,.0f}</td>"
             f"<td>{z['trip_capacity_kg']:,}</td>"
             f"<td>{z['utilisation_pct']}%</td>"
@@ -649,8 +675,8 @@ def _build_zone_map(cust_df: pd.DataFrame, zone_summary: list,
   <table>
     <tr>
       <th>Zone</th><th>Type</th><th>Customers</th>
-      <th>Exp. Stops/Day</th><th>Exp. KG/Day</th>
-      <th>Trip Cap (kg)</th><th>Utilisation</th><th>Status</th>
+      <th>Avg / P75 Stops/Day</th><th>Avg KG/Day</th>
+      <th>Trip Cap (kg)</th><th>P75 Utilisation</th><th>Status</th>
     </tr>
     {summary_rows}
   </table>

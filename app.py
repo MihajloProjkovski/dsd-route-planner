@@ -533,16 +533,17 @@ elif page == "⚙️ Admin":
 
             # Validation table
             st.markdown("#### Zone Validation Summary")
-            st.caption("✅ OK  🟡 Heavy (>70% utilisation)  ⚠️ Overloaded (>90%)  💤 Very light")
+            st.caption("Avg = mean day stops · P75 = busy day stops (1-in-4) · Utilisation based on P75 demand")
+            st.caption("✅ OK  🟡 Heavy on busy days (>70%)  ⚠️ Overloaded on busy days (>90%)  💤 Very light")
             df_sum = pd.DataFrame(zone_summary)[[
                 "zone","vehicle_type","customers",
-                "exp_daily_stops","exp_daily_kg",
+                "exp_daily_stops","p75_daily_stops","exp_daily_kg",
                 "trip_capacity_kg","utilisation_pct","flag"
             ]].copy()
             df_sum.columns = [
                 "Zone","Type","Customers",
-                "Exp Stops/Day","Exp KG/Day",
-                "Trip Cap (kg)","Utilisation %","Status"
+                "Avg Stops/Day","P75 Stops/Day","Avg KG/Day",
+                "Trip Cap (kg)","P75 Utilisation %","Status"
             ]
 
             def _zb_color(row):

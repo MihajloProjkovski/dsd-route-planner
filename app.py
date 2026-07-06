@@ -535,16 +535,23 @@ elif page == "⚙️ Admin":
             st.markdown("#### Zone Validation Summary")
             st.caption("Avg = mean day stops · P75 = busy day stops (1-in-4) · Utilisation based on P75 demand")
             st.caption("✅ OK  🟡 Heavy on busy days (>70%)  ⚠️ Overloaded on busy days (>90%)  💤 Very light")
-            df_sum = pd.DataFrame(zone_summary)[[
-                "zone","vehicle_type","customers",
-                "exp_daily_stops","p75_daily_stops","exp_daily_kg",
-                "trip_capacity_kg","utilisation_pct","flag"
-            ]].copy()
-            df_sum.columns = [
-                "Zone","Type","Customers",
-                "Avg Stops/Day","P75 Stops/Day","Avg KG/Day",
-                "Trip Cap (kg)","P75 Utilisation %","Status"
-            ]
+            df_raw = pd.DataFrame(zone_summary)
+            # Build column list defensively — p75 columns may be absent in old results
+            has_p75 = "p75_daily_stops" in df_raw.columns
+            base_cols  = ["zone","vehicle_type","customers","exp_daily_stops","exp_daily_kg",
+                          "trip_capacity_kg","utilisation_pct","flag"]
+            base_names = ["Zone","Type","Customers","Avg Stops/Day","Avg KG/Day",
+                          "Trip Cap (kg)","Utilisation %","Status"]
+            if has_p75:
+                sel_cols  = ["zone","vehicle_type","customers","exp_daily_stops",
+                             "p75_daily_stops","exp_daily_kg","trip_capacity_kg",
+                             "utilisation_pct","flag"]
+                sel_names = ["Zone","Type","Customers","Avg Stops/Day","P75 Stops/Day",
+                             "Avg KG/Day","Trip Cap (kg)","P75 Utilisation %","Status"]
+            else:
+                sel_cols, sel_names = base_cols, base_names
+            df_sum = df_raw[[c for c in sel_cols if c in df_raw.columns]].copy()
+            df_sum.columns = sel_names[:len(df_sum.columns)]
 
             def _zb_color(row):
                 if "OVER" in str(row["Status"]):

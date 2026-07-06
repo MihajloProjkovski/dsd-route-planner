@@ -110,23 +110,22 @@ def build_zones(history_df: pd.DataFrame, fleet_df: pd.DataFrame,
         name       = grp["Customer Name"].mode().iloc[0] if "Customer Name" in grp.columns else ""
         street     = grp["Street"].mode().iloc[0] if "Street" in grp.columns else ""
         visits     = len(grp)
-        # Fix 2: use 75th-percentile daily frequency (peak-day planning)
-        # This balances zones for heavy days, not average days.
-        if "Delivery Date" in grp.columns and len(grp) >= 4:
-            counts_by_date = grp.groupby("Delivery Date").size()
-            daily_freq = float(np.percentile(counts_by_date.reindex(
-                pd.date_range(grp["Delivery Date"].min(),
-                              grp["Delivery Date"].max(), freq="D"),
-                fill_value=0
-            ).values, 75)) / 1.0  # 75th pct of daily orders (0 on non-order days included)
+        # Improvement #1: use distinct delivery days as frequency weight.
+        # A customer on 30 rows but only 15 distinct delivery dates should count
+        # as 15 deliveries, not 30. This prevents multi-line shipments from
+        # overweighting a customer's contribution to zone workload.
+        if "Delivery Date" in grp.columns:
+            distinct_days = grp["Delivery Date"].nunique()
         else:
-            daily_freq = visits / n_days
+            distinct_days = visits
+        daily_freq = distinct_days / n_days
         return pd.Series({
             "customer_name": name,
             "street":        street,
             "latitude":      grp["Latitude"].median(),
             "longitude":     grp["Longitude"].median(),
-            "visits":        visits,
+            "visits":        distinct_days,   # distinct delivery days (not raw row count)
+            "total_rows":    visits,          # total rows in history (kept for reference)
             "daily_freq":    daily_freq,
             "avg_weight_kg": round(float(avg_wt), 1),
             "dom_type":      dom_type,

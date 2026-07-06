@@ -268,19 +268,31 @@ def solve(stops_df, vehicles_df, zone_affinity=False):
     if zone_affinity:
         # ── Per-vehicle arc costs with zone affinity penalty ──────────────────
         penalty_m        = int(config.ZONE_AFFINITY_PENALTY_KM * 1_000)
-        unzoned_penalty_m = penalty_m // 2   # unzoned stops: softer penalty (10 km equiv.)
-        float_penalty_m  = penalty_m // 2    # Float vehicles: half penalty
+        unzoned_penalty_m = penalty_m // 2
+        float_penalty_m  = penalty_m // 2
 
         stop_zones = [str(stops_df.iloc[i].get("zone", "")) for i in range(len(stops_df))]
+
+        # Build set of zones that actually have stops today
+        zones_with_stops_today = set(stop_zones)
 
         zone_vehicle_zones = {
             str(v["zone"]).strip()
             for v in veh_list
             if str(v["zone"]).strip().lower() not in ("float", "none", "", "nan")
         }
+
+        # Vehicles whose zone has NO stops today → treat as Float in the solver.
+        # Their zone penalty is removed so they freely absorb unzoned/overflow stops.
+        idle_vehicle_zones = {
+            z for z in zone_vehicle_zones
+            if z not in zones_with_stops_today
+        }
+
         float_vehicles = [
             (v_idx, v) for v_idx, v in enumerate(veh_list)
             if str(v["zone"]).strip().lower() in ("float", "none", "", "nan")
+            or str(v["zone"]).strip() in idle_vehicle_zones
         ]
 
         # ── Identify unzoned stops ─────────────────────────────────────────────

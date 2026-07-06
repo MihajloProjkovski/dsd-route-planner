@@ -106,47 +106,73 @@ def build_zones(history_df: pd.DataFrame, fleet_df: pd.DataFrame,
     def agg_customer(grp):
         vt_counts  = grp["Vehicle Type"].value_counts() if "Vehicle Type" in grp.columns else pd.Series()
         dom_type   = vt_counts.index[0] if len(vt_counts) else "Kamion"
+        total_hist = len(grp)
         avg_wt     = grp["Total Weight"].median() if "Total Weight" in grp.columns else 0
         name       = grp["Customer Name"].mode().iloc[0] if "Customer Name" in grp.columns else ""
         street     = grp["Street"].mode().iloc[0] if "Street" in grp.columns else ""
+
+        # ── Three-rule vehicle eligibility ──────────────────────────────────
+        # Mirrors the classification in build_customer_master.py:
+        # Furgon-dominant → Furgon,Kamion,Van
+        # Kamion-dominant → Kamion,Van  (+Furgon if Furgon% ≥ 10%)
+        # Van-dominant    → Van only    (+Kamion if Kamion% ≥ 15%, +Furgon if ≥ 15%)
+        furgon_pct = vt_counts.get("Furgon", 0) / max(total_hist, 1) * 100
+        kamion_pct = vt_counts.get("Kamion", 0) / max(total_hist, 1) * 100
+        if dom_type == "Furgon":
+            eligible = ["Furgon", "Kamion", "Van"]
+        elif dom_type == "Kamion":
+            eligible = ["Kamion", "Van"]
+            if furgon_pct >= 10:
+                eligible.append("Furgon")
+        else:   # Van-dominant
+            eligible = ["Van"]
+            if kamion_pct >= 15:
+                eligible.append("Kamion")
+            if furgon_pct >= 15:
+                eligible.append("Furgon")
+        eligible_str = ",".join(sorted(eligible))
+
+        # Vehicle breakdown string: "Kamion:88.5%  Van:10.4%"
+        breakdown = "  ".join(
+            f"{k}:{v/total_hist*100:.1f}%"
+            for k, v in sorted(vt_counts.items(), key=lambda x: -x[1])
+        ) if len(vt_counts) else ""
+
+        # Improvement #1: distinct delivery days
         visits     = len(grp)
-        # Improvement #1: use distinct delivery days as frequency weight.
         if "Delivery Date" in grp.columns:
             distinct_days = grp["Delivery Date"].nunique()
         else:
             distinct_days = visits
 
-        # Mean daily frequency (used for expected daily stops display)
         daily_freq = distinct_days / n_days
 
-        # P75 daily frequency — dynamic zone sizing.
-        # Zones are sized so that p75 demand (a busy day, happens 1-in-4)
-        # fills the vehicle to target capacity, not the average day.
-        # This means zones are smaller (fewer customers) but handle peak demand
-        # without overflow. Average days will look "light" — that's intentional.
         if "Delivery Date" in grp.columns and distinct_days >= 4:
-            # Build a daily series: 1 for each day the customer ordered, 0 otherwise
-            all_dates  = pd.date_range(grp["Delivery Date"].min(),
-                                       grp["Delivery Date"].max(), freq="D")
-            order_days = set(grp["Delivery Date"].dt.date)
+            all_dates    = pd.date_range(grp["Delivery Date"].min(),
+                                         grp["Delivery Date"].max(), freq="D")
+            order_days   = set(grp["Delivery Date"].dt.date)
             daily_series = np.array([1 if d.date() in order_days else 0
                                      for d in all_dates], dtype=float)
             p75_freq = float(np.percentile(daily_series, 75)) if len(daily_series) > 0 else daily_freq
         else:
-            # For customers with very few visits, fall back to a scaled mean
-            # (equivalent to assuming they order on ~75% of their typical cadence)
             p75_freq = daily_freq * 0.75
+
         return pd.Series({
-            "customer_name": name,
-            "street":        street,
-            "latitude":      grp["Latitude"].median(),
-            "longitude":     grp["Longitude"].median(),
-            "visits":        distinct_days,
-            "total_rows":    visits,
-            "daily_freq":    daily_freq,      # mean — for display in validation table
-            "p75_freq":      p75_freq,        # p75 — used for workload-balanced sizing
-            "avg_weight_kg": round(float(avg_wt), 1),
-            "dom_type":      dom_type,
+            "customer_name":     name,
+            "street":            street,
+            "latitude":          grp["Latitude"].median(),
+            "longitude":         grp["Longitude"].median(),
+            "visits":            distinct_days,
+            "total_rows":        visits,
+            "daily_freq":        daily_freq,
+            "p75_freq":          p75_freq,
+            "avg_weight_kg":     round(float(avg_wt), 1),
+            "avg_cases":         round(float(grp["Number of Cases"].median()), 1)
+                                 if "Number of Cases" in grp.columns else 0,
+            "dom_type":          dom_type,
+            "eligible_vehicles": eligible_str,
+            "vehicle_breakdown": breakdown,
+            "preferred_vehicle": dom_type,
         })
 
     cust = df.groupby("Customer Code").apply(
@@ -473,21 +499,29 @@ def build_zones(history_df: pd.DataFrame, fleet_df: pd.DataFrame,
         updated.columns = updated.columns.str.strip().str.lower()
         updated["customer_code"] = updated["customer_code"].astype(str).str.strip()
         updated["zone"] = updated["customer_code"].map(zone_map).fillna(updated.get("zone", ""))
+        # Also update eligible_vehicles from fresh classification
+        elig_map = dict(zip(cust_zoned["customer_code"].astype(str),
+                            cust_zoned["eligible_vehicles"]))
+        updated["eligible_vehicles"] = updated["customer_code"].map(elig_map).fillna(
+            updated.get("eligible_vehicles", "Kamion,Van"))
+        bd_map = dict(zip(cust_zoned["customer_code"].astype(str),
+                          cust_zoned["vehicle_breakdown"]))
+        updated["vehicle_breakdown"] = updated["customer_code"].map(bd_map).fillna("")
     else:
-        # Build from scratch
-        updated = cust_zoned.rename(columns={"dom_type": "preferred_vehicle"})[
-            ["customer_code", "customer_name", "street",
-             "latitude", "longitude", "zone",
-             "visits", "avg_weight_kg", "preferred_vehicle"]
-        ].copy()
-        updated["special_zone"]       = cust_zoned["special_zone"].fillna("")
-        updated["eligible_vehicles"]  = updated["preferred_vehicle"]
-        updated["time_window_start"]  = "06:00"
-        updated["time_window_end"]    = "18:00"
-        updated["avg_cases"]          = 0
-        updated["kg_per_case"]        = 0
-        updated["vehicle_breakdown"]  = ""
-        updated["notes"]              = ""
+        # Build from scratch with all columns matching customer_master format
+        updated = cust_zoned[[
+            "customer_code", "customer_name", "street",
+            "latitude", "longitude", "zone",
+            "visits", "avg_weight_kg", "avg_cases",
+            "preferred_vehicle", "eligible_vehicles", "vehicle_breakdown",
+        ]].copy()
+        updated["special_zone"]      = cust_zoned["special_zone"].fillna("")
+        updated["time_window_start"] = "06:00"
+        updated["time_window_end"]   = "18:00"
+        updated["kg_per_case"]       = (
+            cust_zoned["avg_weight_kg"] / cust_zoned["avg_cases"].replace(0, np.nan)
+        ).fillna(0).round(3)
+        updated["notes"]             = ""
 
     # ── 8. Build interactive map ───────────────────────────────────────────────
     map_html = _build_zone_map(cust_zoned, zone_summary, fl)

@@ -450,6 +450,22 @@ elif page == "⚙️ Admin":
         else:
             st.warning("No fleet.xlsx found. Go to the Fleet Registry tab to define your fleet first.")
 
+        # Zone mode selector
+        st.markdown("**Zone Building Mode**")
+        zb_mode = st.radio(
+            "zb_mode",
+            ["🚛 Fleet-matched (zones = vehicles)", "🔍 Auto-optimal (natural zones)"],
+            label_visibility="collapsed",
+            help=(
+                "**Fleet-matched** — creates exactly as many zones as vehicles in your fleet. "
+                "Each vehicle gets a dedicated zone.\n\n"
+                "**Auto-optimal** — uses silhouette analysis to find the natural geographic "
+                "zone count. Zones named Kamion_01, Furgon_03 etc. Vehicles not assigned "
+                "to a natural zone become Float (overflow). Produces more compact routes."
+            )
+        )
+        build_mode = "auto" if "Auto" in zb_mode else "fleet"
+
         # History upload
         hist_file = st.file_uploader(
             "Upload historical delivery file",
@@ -465,7 +481,10 @@ elif page == "⚙️ Admin":
 
         if hist_file and fleet_ok:
             if st.button("🗺  Build Zones", type="primary"):
-                with st.spinner("Clustering customers into zones... (may take 30–60s)"):
+                spinner_msg = ("Finding natural zones + clustering... (60–90s)"
+                               if build_mode == "auto"
+                               else "Clustering customers into zones... (30–60s)")
+                with st.spinner(spinner_msg):
                     try:
                         hist_df   = pd.read_excel(io.BytesIO(hist_file.getvalue()))
                         master_df = None
@@ -478,14 +497,16 @@ elif page == "⚙️ Admin":
                             except Exception:
                                 pass
 
-                        updated, zone_summary, map_html, quality = fr.build_zones(
-                            hist_df, fl_df, master_df
+                        updated, zone_summary, map_html, quality, fleet_rec = fr.build_zones(
+                            hist_df, fl_df, master_df, mode=build_mode
                         )
                         st.session_state.update({
-                            "zb_updated":   updated,
-                            "zb_summary":   zone_summary,
-                            "zb_map":       map_html,
-                            "zb_quality":   quality,
+                            "zb_updated":    updated,
+                            "zb_summary":    zone_summary,
+                            "zb_map":        map_html,
+                            "zb_quality":    quality,
+                            "zb_fleet_rec":  fleet_rec,
+                            "zb_mode":       build_mode,
                         })
                     except Exception as e:
                         st.error(f"Zone building failed: {e}")
@@ -494,9 +515,28 @@ elif page == "⚙️ Admin":
             updated      = st.session_state["zb_updated"]
             zone_summary = st.session_state["zb_summary"]
             map_html     = st.session_state["zb_map"]
+            fleet_rec    = st.session_state.get("zb_fleet_rec")
+            run_mode     = st.session_state.get("zb_mode", "fleet")
 
             st.markdown("---")
             st.success(f"✅ Zones built for **{len(updated):,}** customers across **{len(zone_summary)}** zones.")
+
+            # Auto mode: show fleet recommendation
+            if run_mode == "auto" and fleet_rec:
+                st.markdown("#### Fleet Recommendation")
+                st.caption("Natural zone count vs your fleet size. Vehicles beyond natural zones become Float (overflow).")
+                rc1, rc2, rc3 = st.columns(3)
+                for col, vtype in zip([rc1, rc2, rc3], ["Kamion", "Furgon", "Van"]):
+                    rec = fleet_rec.get(vtype, {})
+                    col.metric(
+                        vtype,
+                        f"{rec.get('natural_zones', '?')} zones",
+                        delta=f"{rec.get('recommended_float', 0)} Float" if rec.get("recommended_float", 0) > 0 else "No overflow",
+                        delta_color="off",
+                        help=f"Fleet available: {rec.get('fleet_available','?')}  |  "
+                             f"Natural zones: {rec.get('natural_zones','?')}  |  "
+                             f"Recommended Float: {rec.get('recommended_float','?')}"
+                    )
 
             # Quality score
             q = st.session_state.get("zb_quality", {})

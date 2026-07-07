@@ -6,13 +6,20 @@ clusters customers into workload-balanced zones, returns:
   - updated customer master DataFrame with zone column filled
   - zone summary for validation display
   - interactive Leaflet map HTML
+  - quality metrics dict
+
+Two modes:
+  "fleet"  — zones = number of vehicles (current behaviour)
+  "auto"   — DBSCAN finds natural zone count; recommends fleet assignment
 """
 
 import json
 import warnings
 import numpy as np
 import pandas as pd
-from sklearn.cluster import KMeans
+from sklearn.cluster import KMeans, DBSCAN
+from sklearn.metrics import silhouette_score
+from sklearn.preprocessing import StandardScaler
 
 warnings.filterwarnings("ignore")
 
@@ -65,8 +72,34 @@ def detect_special_zone(lat, lon):
 
 # ── Core zone builder ──────────────────────────────────────────────────────────
 
+def find_optimal_zones(coords: np.ndarray, min_zones: int = 2,
+                       max_zones: int = 30) -> int:
+    """
+    Find the natural number of geographic zones using silhouette score
+    optimization over k-means (more stable than DBSCAN for variable densities).
+    Returns the k that maximises silhouette score.
+    """
+    if len(coords) < max(min_zones * 3, 10):
+        return max(min_zones, len(coords) // 5)
+
+    scaler  = StandardScaler()
+    X       = scaler.fit_transform(coords)
+    scores  = {}
+    for k in range(min_zones, min(max_zones + 1, len(coords) // 3)):
+        km  = KMeans(n_clusters=k, random_state=42, n_init=10, max_iter=300)
+        lbl = km.fit_predict(X)
+        if len(set(lbl)) < 2:
+            continue
+        try:
+            scores[k] = silhouette_score(X, lbl, sample_size=min(500, len(X)))
+        except Exception:
+            continue
+    return max(scores, key=scores.get) if scores else min_zones
+
+
 def build_zones(history_df: pd.DataFrame, fleet_df: pd.DataFrame,
-                master_df: pd.DataFrame | None = None):
+                master_df: pd.DataFrame | None = None,
+                mode: str = "fleet"):
     """
     Parameters
     ----------
@@ -79,10 +112,11 @@ def build_zones(history_df: pd.DataFrame, fleet_df: pd.DataFrame,
 
     Returns
     -------
-    updated_master : pd.DataFrame with zone column assigned
-    zone_summary   : list of dicts for validation table
-    map_html       : str HTML of interactive Leaflet map
-    quality        : dict of zone quality metrics (composite score 0-100)
+    updated_master       : pd.DataFrame with zone column assigned
+    zone_summary         : list of dicts for validation table
+    map_html             : str HTML of interactive Leaflet map
+    quality              : dict of zone quality metrics (composite score 0-100)
+    fleet_recommendation : dict with natural zone counts per type (auto mode only)
     """
     global _DATASET_DAYS
 
@@ -206,8 +240,42 @@ def build_zones(history_df: pd.DataFrame, fleet_df: pd.DataFrame,
 
     fl_regular = fl[~fl["vehicle_name"].isin(special_veh_names)].copy()
 
-    # Count vehicles per type for clustering
-    type_counts = fl_regular.groupby("vehicle_type")["vehicle_name"].apply(list).to_dict()
+    # ── Determine zone counts per vehicle type ────────────────────────────────
+    # mode="fleet"  → zones = number of fleet vehicles (original behaviour)
+    # mode="auto"   → silhouette-optimal k per type; vehicles not matched = Float
+    if mode == "auto":
+        auto_zone_counts = {}
+        fleet_recommendation = {}
+        for vtype in ["Kamion", "Furgon", "Van"]:
+            mask_ns = cust["special_zone"].isna()
+            sub_coords = cust.loc[mask_ns & (cust["dom_type"] == vtype),
+                                  ["latitude","longitude"]].values
+            if len(sub_coords) < 6:
+                auto_zone_counts[vtype] = 1
+            else:
+                n_fleet = len(fl_regular[fl_regular["vehicle_type"] == vtype])
+                auto_zone_counts[vtype] = find_optimal_zones(
+                    sub_coords,
+                    min_zones=max(2, n_fleet // 3),
+                    max_zones=n_fleet
+                )
+            fleet_recommendation[vtype] = {
+                "natural_zones":      auto_zone_counts[vtype],
+                "fleet_available":    len(fl_regular[fl_regular["vehicle_type"] == vtype]),
+                "recommended_float":  max(0, len(fl_regular[fl_regular["vehicle_type"] == vtype])
+                                          - auto_zone_counts[vtype]),
+            }
+        # Build type_counts using auto zone count — assign first N vehicles to zones
+        type_counts = {}
+        for vtype, n_zones in auto_zone_counts.items():
+            vnames = fl_regular[fl_regular["vehicle_type"] == vtype]["vehicle_name"].tolist()
+            type_counts[vtype] = vnames[:n_zones]   # first N get dedicated zones
+        # Store recommendation for return
+        _auto_recommendation = fleet_recommendation
+    else:
+        # Fleet mode: zones = vehicles (original)
+        type_counts = fl_regular.groupby("vehicle_type")["vehicle_name"].apply(list).to_dict()
+        _auto_recommendation = None
 
     # ── 5. Six-improvement clustering algorithm ────────────────────────────────
     #
@@ -220,9 +288,6 @@ def build_zones(history_df: pd.DataFrame, fleet_df: pd.DataFrame,
 
     from sklearn.cluster import AgglomerativeClustering
 
-    # Use p75_freq for workload_score — zones sized for busy days, not average days.
-    # This means each zone will have fewer customers (sized for ~p75 demand),
-    # leaving buffer capacity for peak days so fewer stops go unassigned.
     cust["workload_score"] = cust["p75_freq"] * cust["avg_weight_kg"]
     cust["zone"] = None
 
@@ -574,7 +639,7 @@ def build_zones(history_df: pd.DataFrame, fleet_df: pd.DataFrame,
         "anchor_threshold":   ANCHOR_THRESHOLD,
     }
 
-    return updated, zone_summary, map_html, quality
+    return updated, zone_summary, map_html, quality, _auto_recommendation
 
 
 # ── Map builder ────────────────────────────────────────────────────────────────

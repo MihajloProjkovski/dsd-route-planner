@@ -1,5 +1,5 @@
 """
-fleet_registry.py
+fleet_registry.py  v2.1
 -----------------
 Zone Builder logic: reads historical delivery data + fleet definition,
 clusters customers into workload-balanced zones, returns:
@@ -10,7 +10,7 @@ clusters customers into workload-balanced zones, returns:
 
 Two modes:
   "fleet"  — zones = number of vehicles (current behaviour)
-  "auto"   — DBSCAN finds natural zone count; recommends fleet assignment
+  "auto"   — silhouette-optimal k per type; recommends fleet assignment
 """
 
 import json

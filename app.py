@@ -525,35 +525,28 @@ elif page == "⚙️ Admin":
             # Auto mode: show fleet recommendation
             if run_mode == "auto" and fleet_rec:
                 st.markdown("#### Fleet Recommendation")
-                st.caption("Natural zone count vs your fleet size. Vehicles beyond natural zones become Float (overflow).")
+                st.caption("Zones are sized from geography/workload/customer-count targets, independent of fleet size. "
+                           "Zones without a dedicated vehicle are served dynamically by Float vehicles.")
                 rc1, rc2, rc3 = st.columns(3)
                 for col, vtype in zip([rc1, rc2, rc3], ["Kamion", "Furgon", "Van"]):
                     rec = fleet_rec.get(vtype, {})
-                    shortfall = rec.get("fleet_shortfall", 0)
+                    unclaimed, spare = rec.get("unclaimed_zones", 0), rec.get("spare_float", 0)
                     col.metric(
                         vtype,
-                        f"{rec.get('natural_zones', '?')} zones",
-                        delta=(f"{shortfall} short" if shortfall > 0
-                               else (f"{rec.get('recommended_float', 0)} Float"
-                                     if rec.get("recommended_float", 0) > 0 else "No overflow")),
-                        delta_color="inverse" if shortfall > 0 else "off",
+                        f"{rec.get('n_zones', '?')} zones",
+                        delta=(f"{unclaimed} unclaimed" if unclaimed > 0
+                               else (f"{spare} spare Float" if spare > 0 else "Fully covered")),
+                        delta_color="off",
                         help=f"Fleet available: {rec.get('fleet_available','?')}  |  "
+                             f"Dedicated: {rec.get('dedicated_zones','?')}  |  "
                              f"Workload needs: {rec.get('workload_min_zones','?')} zones  |  "
                              f"Customer-count needs: {rec.get('customer_min_zones','?')} zones  |  "
-                             f"Natural zones: {rec.get('natural_zones','?')}  |  "
-                             f"Avg zone radius: {rec.get('achieved_avg_radius_km') if rec.get('achieved_avg_radius_km') is not None else '?'} km  |  "
-                             f"Recommended Float: {rec.get('recommended_float','?')}"
+                             f"Avg zone radius: {rec.get('achieved_radius_km') if rec.get('achieved_radius_km') is not None else '?'} km"
                     )
-                shortfalls = [rec["shortfall_msg"] for rec in fleet_rec.values()
-                              if rec.get("fleet_shortfall", 0) > 0]
-                if shortfalls:
-                    st.warning("**Fleet capacity shortfall detected:**\n\n" +
-                               "\n\n".join(f"- {m}" for m in shortfalls))
-                radius_warnings = [rec["radius_shortfall_msg"] for rec in fleet_rec.values()
-                                    if rec.get("radius_shortfall_msg")]
-                if radius_warnings:
-                    st.warning("**Zones still geographically spread out:**\n\n" +
-                               "\n\n".join(f"- {m}" for m in radius_warnings))
+                coverage_msgs = [rec["coverage_msg"] for rec in fleet_rec.values() if rec.get("coverage_msg")]
+                if coverage_msgs:
+                    st.info("**Zone / fleet coverage:**\n\n" +
+                            "\n\n".join(f"- {m}" for m in coverage_msgs))
 
             # Quality score
             q = st.session_state.get("zb_quality", {})

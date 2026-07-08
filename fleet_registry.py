@@ -30,8 +30,11 @@ try:
     DEPOT_LAT              = config.DEPOT_LAT
     DEPOT_LON              = config.DEPOT_LON
     MAX_STOPS_PER_DAY      = config.MAX_STOPS_PER_DAY
-    MAX_CUSTOMERS_PER_ZONE = MAX_CUSTOMERS_PER_ZONE
-    MAX_ZONE_RADIUS_KM     = MAX_ZONE_RADIUS_KM
+    MAX_CUSTOMERS_PER_ZONE = config.MAX_CUSTOMERS_PER_ZONE
+    MAX_ZONE_RADIUS_KM     = config.MAX_ZONE_RADIUS_KM
+    URBAN_ZONE_RADIUS_KM   = config.URBAN_ZONE_RADIUS_KM
+    RURAL_ZONE_RADIUS_KM   = config.RURAL_ZONE_RADIUS_KM
+    URBAN_CORE_RADIUS_KM   = config.URBAN_CORE_RADIUS_KM
 except Exception:
     SPECIAL_ZONES          = {}
     DEPOT_LAT              = 42.005
@@ -39,6 +42,9 @@ except Exception:
     MAX_STOPS_PER_DAY      = 12
     MAX_CUSTOMERS_PER_ZONE = 60
     MAX_ZONE_RADIUS_KM     = 3.5
+    URBAN_ZONE_RADIUS_KM   = 1.5
+    RURAL_ZONE_RADIUS_KM   = 2.0
+    URBAN_CORE_RADIUS_KM   = 6.0
 
 # Total days in the historical dataset window (used for expected daily frequency)
 _DATASET_DAYS = None
@@ -76,31 +82,39 @@ def detect_special_zone(lat, lon):
     return None
 
 
-def _avg_radius_km(coords: np.ndarray, labels: np.ndarray) -> float:
-    """Average customer -> own-cluster-centroid haversine distance (km),
-    measured on raw lat/lon (mirrors the zone quality-score compactness calc)."""
+def _cluster_stats_km(coords: np.ndarray, labels: np.ndarray) -> dict:
+    """Per-cluster (centroid_lat, centroid_lon, avg_radius_km), measured on
+    raw lat/lon (mirrors the zone quality-score compactness calc)."""
     df = pd.DataFrame(coords, columns=["latitude", "longitude"])
     df["label"] = labels
-    radii = []
-    for _, grp in df.groupby("label"):
+    out = {}
+    for label, grp in df.groupby("label"):
         clat, clon = grp["latitude"].mean(), grp["longitude"].mean()
         d = grp.apply(lambda r: haversine_km(r["latitude"], r["longitude"], clat, clon), axis=1)
-        radii.append(float(d.mean()))
-    return float(np.mean(radii)) if radii else 0.0
+        out[label] = (clat, clon, float(d.mean()))
+    return out
+
+
+def _zone_radius_target_km(clat: float, clon: float) -> float:
+    """Distance-from-depot-adaptive per-zone radius target: tighter inside
+    the urban core, looser outside it."""
+    dist_from_depot = haversine_km(clat, clon, DEPOT_LAT, DEPOT_LON)
+    return URBAN_ZONE_RADIUS_KM if dist_from_depot <= URBAN_CORE_RADIUS_KM else RURAL_ZONE_RADIUS_KM
 
 
 # ── Core zone builder ──────────────────────────────────────────────────────────
 
 def find_optimal_zones(coords: np.ndarray, min_zones: int = 2,
-                       max_zones: int = 30, max_avg_radius_km: float | None = None,
+                       max_zones: int = 30, radius_aware: bool = False,
                        return_diagnostics: bool = False):
     """
     Find the natural number of geographic zones using silhouette score
     optimization over k-means (more stable than DBSCAN for variable densities).
-    Returns the k that maximises silhouette score among candidates whose
-    average customer-to-centroid radius is within max_avg_radius_km (if given);
-    falls back to the most compact k achievable if none qualify.
-    If return_diagnostics, returns (k, achieved_avg_radius_km) instead of just k.
+    If radius_aware, prefers the best-silhouette k among candidates where
+    EVERY individual zone's avg radius is within its own urban/rural target
+    (see _zone_radius_target_km); falls back to the k with the smallest worst
+    zone if none qualify. If return_diagnostics, returns (k, achieved_radius_km)
+    — the worst zone's radius for the chosen k — instead of just k.
     """
     if len(coords) < max(min_zones * 3, 10):
         k = max(min_zones, len(coords) // 5)
@@ -109,7 +123,7 @@ def find_optimal_zones(coords: np.ndarray, min_zones: int = 2,
     scaler  = StandardScaler()
     X       = scaler.fit_transform(coords)
     scores  = {}
-    radii   = {}
+    cluster_stats = {}
     for k in range(min_zones, min(max_zones + 1, len(coords) // 3)):
         km  = KMeans(n_clusters=k, random_state=42, n_init=10, max_iter=300)
         lbl = km.fit_predict(X)
@@ -119,19 +133,23 @@ def find_optimal_zones(coords: np.ndarray, min_zones: int = 2,
             scores[k] = silhouette_score(X, lbl, sample_size=min(500, len(X)))
         except Exception:
             continue
-        radii[k] = _avg_radius_km(coords, lbl)
+        cluster_stats[k] = _cluster_stats_km(coords, lbl)
 
     if not scores:
         return (min_zones, None) if return_diagnostics else min_zones
 
-    if max_avg_radius_km is None:
-        best_k = max(scores, key=scores.get)
+    if not radius_aware:
+        best_k, achieved = max(scores, key=scores.get), None
     else:
-        qualifying = {k: s for k, s in scores.items()
-                      if radii.get(k, float("inf")) <= max_avg_radius_km}
-        best_k = max(qualifying, key=qualifying.get) if qualifying else min(radii, key=radii.get)
+        def worst_excess(k):
+            return max((r - _zone_radius_target_km(lat, lon)
+                        for lat, lon, r in cluster_stats[k].values()), default=0.0)
 
-    return (best_k, radii.get(best_k)) if return_diagnostics else best_k
+        qualifying = {k: s for k, s in scores.items() if worst_excess(k) <= 0}
+        best_k = max(qualifying, key=qualifying.get) if qualifying else min(scores, key=worst_excess)
+        achieved = max((r for _, _, r in cluster_stats[best_k].values()), default=0.0)
+
+    return (best_k, achieved) if return_diagnostics else best_k
 
 
 def build_zones(history_df: pd.DataFrame, fleet_df: pd.DataFrame,
@@ -288,79 +306,77 @@ def build_zones(history_df: pd.DataFrame, fleet_df: pd.DataFrame,
             type_mask  = mask_ns & (cust["dom_type"] == vtype)
             sub_coords = cust.loc[type_mask, ["latitude","longitude"]].values
             n_fleet    = len(fl_regular[fl_regular["vehicle_type"] == vtype])
+            n_cust     = len(sub_coords)
 
-            n_cust = len(sub_coords)
-            total_p75_stops = float(cust.loc[type_mask, "p75_freq"].sum())
+            total_p75_stops    = float(cust.loc[type_mask, "p75_freq"].sum())
             workload_min_zones = max(1, int(np.ceil(total_p75_stops / MAX_STOPS_PER_DAY)))
             customer_min_zones = max(1, int(np.ceil(n_cust / MAX_CUSTOMERS_PER_ZONE)))
             floor_zones = max(2, workload_min_zones, customer_min_zones)
-            shortfall = 0
-            achieved_avg_radius_km = None
+            # defensive: never propose more zones than ~2 customers/zone could support
+            floor_zones = min(floor_zones, max(1, n_cust // 2)) if n_cust > 0 else floor_zones
 
+            achieved_radius_km = None
             if n_cust < 6:
                 auto_zone_counts[vtype] = 1
-            elif floor_zones > n_fleet:
-                # Workload or customer count needs more zones than vehicles of
-                # this type exist — can't search past n_fleet (1 zone == 1
-                # vehicle always). Use every available vehicle as its own
-                # zone; that's trivially optimal here. n_fleet may be 0, which
-                # is handled downstream (empty vehicle list → customers fall
-                # to the unmatched path).
-                auto_zone_counts[vtype] = n_fleet
-                shortfall = floor_zones - n_fleet
             else:
-                auto_zone_counts[vtype], achieved_avg_radius_km = find_optimal_zones(
+                # Zone count is sized purely by geography/workload/customer-count
+                # targets — NOT capped by fleet size. Vehicle coverage of the
+                # resulting zones is a separate concern, handled below.
+                zone_upper_bound = min(n_cust // 3, 50)
+                auto_zone_counts[vtype], achieved_radius_km = find_optimal_zones(
                     sub_coords,
                     min_zones=floor_zones,
-                    max_zones=n_fleet,
-                    max_avg_radius_km=MAX_ZONE_RADIUS_KM,
+                    max_zones=zone_upper_bound,
+                    radius_aware=True,
                     return_diagnostics=True,
                 )
 
-            # which constraint(s) actually drove a count shortfall
-            drivers = []
-            if workload_min_zones > n_fleet:
-                drivers.append(f"workload (~{workload_min_zones} zones)")
-            if customer_min_zones > n_fleet:
-                drivers.append(f"customer count (~{customer_min_zones} zones)")
-            reason_str = " and ".join(drivers) or "minimum viable zone count"
+            n_zones     = auto_zone_counts[vtype]
+            dedicated   = min(n_zones, n_fleet)
+            unclaimed   = max(0, n_zones - n_fleet)
+            spare_float = max(0, n_fleet - n_zones)
 
-            radius_shortfall_msg = ""
-            if achieved_avg_radius_km is not None and achieved_avg_radius_km > MAX_ZONE_RADIUS_KM:
-                radius_shortfall_msg = (
-                    f"Even using all {auto_zone_counts[vtype]} {vtype} zone(s), avg "
-                    f"customer-to-zone-centre distance is {achieved_avg_radius_km:.1f} km "
-                    f"(target <={MAX_ZONE_RADIUS_KM} km) — zones will still span a "
-                    f"wide area. Consider adding {vtype} vehicles."
-                )
+            coverage_msg = (
+                f"{n_zones} {vtype} zone(s) created from geography/workload/customer-count "
+                f"targets. {dedicated} get a dedicated vehicle" +
+                (f"; {unclaimed} zone(s) have no dedicated vehicle and will be served "
+                 f"dynamically by Float vehicles." if unclaimed > 0 else ".") +
+                (f" {spare_float} extra {vtype} vehicle(s) beyond the natural zone count "
+                 f"are available as Float capacity." if spare_float > 0 else "")
+            )
 
             fleet_recommendation[vtype] = {
-                "natural_zones":          auto_zone_counts[vtype],
-                "fleet_available":        n_fleet,
-                "recommended_float":      max(0, n_fleet - auto_zone_counts[vtype]),
-                "workload_min_zones":     workload_min_zones,
-                "customer_min_zones":     customer_min_zones,
-                "fleet_shortfall":        shortfall,
-                "achieved_avg_radius_km": (round(achieved_avg_radius_km, 2)
-                                            if achieved_avg_radius_km is not None else None),
-                "radius_shortfall_msg":   radius_shortfall_msg,
-                "shortfall_msg": (
-                    f"{reason_str} needs ~{floor_zones} zones (at {MAX_STOPS_PER_DAY} "
-                    f"stops/day and {MAX_CUSTOMERS_PER_ZONE} customers/zone caps) "
-                    f"but only {n_fleet} {vtype} vehicle(s) available — {shortfall} short. "
-                    f"Add vehicles, raise the caps, or plan for overflow via Float/other types."
-                ) if shortfall > 0 else "",
+                "n_zones":            n_zones,
+                "fleet_available":    n_fleet,
+                "dedicated_zones":    dedicated,
+                "unclaimed_zones":    unclaimed,
+                "spare_float":        spare_float,
+                "workload_min_zones": workload_min_zones,
+                "customer_min_zones": customer_min_zones,
+                "achieved_radius_km": round(achieved_radius_km, 2) if achieved_radius_km is not None else None,
+                "coverage_msg":       coverage_msg,
             }
-        # Build type_counts using auto zone count — assign first N vehicles to zones
-        type_counts = {}
+
+        # Generic zone naming, decoupled from real vehicle identity
+        type_counts      = {}
+        zone_type_map    = {}
+        zone_vehicle_map = {}
         for vtype, n_zones in auto_zone_counts.items():
-            vnames = fl_regular[fl_regular["vehicle_type"] == vtype]["vehicle_name"].tolist()
-            type_counts[vtype] = vnames[:n_zones]   # first N get dedicated zones
+            zone_names = [f"{vtype}_{i+1:02d}" for i in range(n_zones)]
+            type_counts[vtype] = zone_names
+            for zn in zone_names:
+                zone_type_map[zn] = vtype
+            # busiest-zone-first ("_01") <-> highest-capacity-vehicle-first pairing
+            vehicles_sorted = (fl_regular[fl_regular["vehicle_type"] == vtype]
+                               .sort_values("daily_cap_kg", ascending=False)["vehicle_name"].tolist())
+            zone_vehicle_map.update(dict(zip(zone_names, vehicles_sorted)))  # caps at min(n_zones, n_fleet)
+
         # Store recommendation for return
         _auto_recommendation = fleet_recommendation
     else:
         # Fleet mode: zones = vehicles (original)
         type_counts = fl_regular.groupby("vehicle_type")["vehicle_name"].apply(list).to_dict()
+        zone_type_map, zone_vehicle_map = {}, {}
         _auto_recommendation = None
 
     # ── 5. Six-improvement clustering algorithm ────────────────────────────────
@@ -503,6 +519,11 @@ def build_zones(history_df: pd.DataFrame, fleet_df: pd.DataFrame,
             return sub_df
 
         n_clust = len(vehicle_names)
+        # Crash-prevention backstop: KMeans/AgglomerativeClustering require
+        # n_clusters <= n_samples. Unreachable with today's config values but
+        # zone count is no longer clamped to fleet size, so this is real insurance.
+        n_clust = min(n_clust, len(sub_df))
+        vehicle_names = vehicle_names[:n_clust]
         sub_df  = sub_df.reset_index(drop=True)
 
         is_anchor = sub_df["visits"] >= ANCHOR_THRESHOLD
@@ -605,19 +626,28 @@ def build_zones(history_df: pd.DataFrame, fleet_df: pd.DataFrame,
         p75_daily_stops  = zdf["p75_freq"].sum()
         p75_daily_weight = (zdf["p75_freq"] * zdf["avg_weight_kg"]).sum()
 
-        veh_row = fl[fl["vehicle_name"] == zone_name]
+        resolved_vname = zone_vehicle_map.get(zone_name, zone_name)   # no-op for fleet/special-zone paths
+        veh_row = fl[fl["vehicle_name"] == resolved_vname]
         if not veh_row.empty:
             trip_cap  = veh_row.iloc[0]["capacity_kg"]
             daily_cap = veh_row.iloc[0]["daily_cap_kg"]
             vtype     = veh_row.iloc[0]["vehicle_type"]
         else:
-            trip_cap  = 0
-            daily_cap = 0
-            vtype     = "?"
+            # No dedicated vehicle (auto-mode unclaimed zone) — fall back to
+            # the type-level average so utilisation still means something.
+            vtype = zone_type_map.get(zone_name, "?")
+            type_fleet = fl_regular[fl_regular["vehicle_type"] == vtype]
+            if len(type_fleet) > 0:
+                trip_cap  = type_fleet["capacity_kg"].mean()
+                daily_cap = type_fleet["daily_cap_kg"].mean()
+            else:
+                trip_cap, daily_cap = 0, 0
 
         # Utilisation based on p75 demand — flags zones that overflow on busy days
         utilisation = p75_daily_weight / daily_cap * 100 if daily_cap > 0 else 0
-        if utilisation > 90:
+        if n_cust > MAX_CUSTOMERS_PER_ZONE:
+            flag = f"🔴 OVER customer cap ({n_cust}/{MAX_CUSTOMERS_PER_ZONE}) — needs more {vtype} vehicles"
+        elif utilisation > 90:
             flag = "⚠️ OVERLOADED on busy days — consider splitting"
         elif utilisation > 70:
             flag = "🟡 Heavy on busy days"
@@ -675,7 +705,8 @@ def build_zones(history_df: pd.DataFrame, fleet_df: pd.DataFrame,
         updated["notes"]             = ""
 
     # ── 8. Build interactive map ───────────────────────────────────────────────
-    map_html = _build_zone_map(cust_zoned, zone_summary, fl)
+    map_html = _build_zone_map(cust_zoned, zone_summary, fl, zone_vehicle_map,
+                               fleet_recommendation if mode == "auto" else None)
 
     # ── Improvement 6: Zone quality score (Fix 1: per-type CV) ─────────────────
     # Build per-type stop and weight arrays
@@ -739,12 +770,33 @@ _PALETTE = [
 
 
 def _build_zone_map(cust_df: pd.DataFrame, zone_summary: list,
-                    fleet_df: pd.DataFrame) -> str:
+                    fleet_df: pd.DataFrame, zone_vehicle_map: dict | None = None,
+                    fleet_recommendation: dict | None = None) -> str:
     """Build a self-contained Leaflet HTML map showing zones + customers."""
 
     # Assign colours per zone
     all_zones   = sorted(cust_df["zone"].dropna().unique())
     zone_colour = {z: _PALETTE[i % len(_PALETTE)] for i, z in enumerate(all_zones)}
+
+    # Zone/vehicle coverage section (auto mode only)
+    zone_vehicle_map = zone_vehicle_map or {}
+    coverage_rows = ""
+    if fleet_recommendation:
+        for vtype, rec in fleet_recommendation.items():
+            unclaimed_zones = [z for z in all_zones
+                               if z.startswith(f"{vtype}_") and z not in zone_vehicle_map]
+            if unclaimed_zones:
+                coverage_rows += (
+                    f"<div class='cr' style='color:#E74C3C'>{vtype}: "
+                    f"{len(unclaimed_zones)} zone(s) unclaimed (Float-served)</div>"
+                )
+            if rec.get("spare_float", 0) > 0:
+                coverage_rows += (
+                    f"<div class='cr' style='color:#7F8C8D'>{vtype}: "
+                    f"{rec['spare_float']} spare Float vehicle(s)</div>"
+                )
+        if not coverage_rows:
+            coverage_rows = "<div class='cr' style='color:#7F8C8D'>All zones have a dedicated vehicle.</div>"
 
     all_types = sorted(cust_df["dom_type"].unique())
 
@@ -851,6 +903,7 @@ def _build_zone_map(cust_df: pd.DataFrame, zone_summary: list,
       <button class="btn" onclick="tA('zone',true)">All</button>
       <button class="btn" onclick="tA('zone',false)">None</button>
     </div>
+    {"<h2>Zone / Vehicle Coverage</h2><div class='fs' style='font-size:10px;color:#95A5A6;padding:4px 0 6px'>Zones without a dedicated vehicle are served dynamically by Float vehicles.</div><div class='fs'>" + coverage_rows + "</div>" if coverage_rows else ""}
   </div>
   <div id="stats">Showing <b id="vc">-</b> of <b id="tc">-</b> customers</div>
 </div>

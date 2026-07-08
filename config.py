@@ -48,9 +48,11 @@ STOP_COUNT_SPAN_COEFF   = 15_000  # meter-equivalent span-cost coeff for balanci
 
 # ── Zone geographic compactness (auto mode) ─────────────────────────────
 MAX_CUSTOMERS_PER_ZONE = 60   # customer-count floor: min_zones >= ceil(n_cust / this)
-MAX_ZONE_RADIUS_KM     = 3.5  # target avg customer-to-zone-centroid radius (km);
-                               # anchored near the existing 3.0 km _SA_MAX_EXTRA_KM
-                               # guard and the 5 km denominator in compact_score
+MAX_ZONE_RADIUS_KM     = 3.5  # legacy flat target, kept for reference; superseded by
+                               # the urban/rural pair below
+URBAN_ZONE_RADIUS_KM   = 1.5  # per-zone worst-case radius target inside the urban core
+RURAL_ZONE_RADIUS_KM   = 2.0  # per-zone worst-case radius target outside the urban core
+URBAN_CORE_RADIUS_KM   = 6.0  # distance from depot (km) defining "urban" vs "rural"
 
 # â”€â”€ Geo clustering (used by build_customer_master.py) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 # Cluster counts are derived dynamically from the Vehicles sheet at build time.

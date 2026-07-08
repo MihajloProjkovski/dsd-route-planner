@@ -463,8 +463,14 @@ def solve(stops_df, vehicles_df, zone_affinity=False):
 
     stop_cb_idx = routing.RegisterUnaryTransitCallback(stop_count_cb)
     routing.AddDimensionWithVehicleCapacity(
-        stop_cb_idx, 0, [config.MAX_STOPS_PER_DAY] * n_veh, True, "StopCount"
+        stop_cb_idx, 0, [config.MAX_STOPS_PER_DAY_HARD] * n_veh, True, "StopCount"
     )
+    stop_dim = routing.GetDimensionOrDie("StopCount")
+    for v in range(n_veh):
+        stop_dim.SetCumulVarSoftUpperBound(
+            routing.End(v), config.MAX_STOPS_PER_DAY, config.STOP_COUNT_SOFT_PENALTY
+        )
+    stop_dim.SetGlobalSpanCostCoefficient(config.STOP_COUNT_SPAN_COEFF)
 
     for node in range(1, n_nodes):
         allowed = allowed_indices(node - 1)
@@ -957,9 +963,10 @@ TYPE_FILLS    = {
 }
 SPECIAL_FILL  = PatternFill("solid", fgColor="FFD7D7")
 TRIP_HDR_FILL = PatternFill("solid", fgColor="2E75B6")
-OVERLOAD_FILL = PatternFill("solid", fgColor="FFDDC1")
-LIGHT_FILL    = PatternFill("solid", fgColor="FFFACD")
-NO_ORD_FILL   = PatternFill("solid", fgColor="E8E8E8")
+OVERLOAD_FILL     = PatternFill("solid", fgColor="FFDDC1")
+ABOVE_TARGET_FILL = PatternFill("solid", fgColor="FDEBD0")
+LIGHT_FILL        = PatternFill("solid", fgColor="FFFACD")
+NO_ORD_FILL       = PatternFill("solid", fgColor="E8E8E8")
 
 
 # ── Route map generator ───────────────────────────────────────────────────────
@@ -1185,9 +1192,10 @@ def write_excel(routes, stops_df, unassigned_indices, path, zone_summary=None):
                       "Status", "Notes"])
         _style_header(ws_ov)
         status_fills = {
-            "OVERLOADED": OVERLOAD_FILL,
-            "LIGHT":      LIGHT_FILL,
-            "NO ORDERS":  NO_ORD_FILL,
+            "OVERLOADED":   OVERLOAD_FILL,
+            "ABOVE TARGET": ABOVE_TARGET_FILL,
+            "LIGHT":        LIGHT_FILL,
+            "NO ORDERS":    NO_ORD_FILL,
         }
         for zrow in zone_summary:
             ws_ov.append([
@@ -1385,8 +1393,10 @@ def build_zone_summary_from_routes(routes, original_zone_counts):
 
         if n_stops == 0:
             status = "NO ORDERS"
+        elif n_stops > config.MAX_STOPS_PER_DAY_HARD:
+            status = "OVERLOADED"      # should never occur — hard cap prevents it; safety-net label
         elif n_stops > config.MAX_STOPS_PER_DAY:
-            status = "OVERLOADED"
+            status = "ABOVE TARGET"    # 13-15, expected soft-cap overage
         elif n_stops <= 2:
             status = "LIGHT"
         else:
@@ -1463,9 +1473,10 @@ def main_territory():
     write_excel(routes, stops_df, unassigned, config.OUTPUT_FILE, zone_summary)
 
     stops_assigned = sum(len(r["stops"]) for r in routes)
-    overloaded = [z for z in zone_summary if z["status"] == "OVERLOADED"]
-    light      = [z for z in zone_summary if z["status"] == "LIGHT"]
-    no_orders  = [z for z in zone_summary if z["status"] == "NO ORDERS"]
+    overloaded    = [z for z in zone_summary if z["status"] == "OVERLOADED"]
+    above_target  = [z for z in zone_summary if z["status"] == "ABOVE TARGET"]
+    light         = [z for z in zone_summary if z["status"] == "LIGHT"]
+    no_orders     = [z for z in zone_summary if z["status"] == "NO ORDERS"]
 
     print(f"\nDone.")
     print(f"  Output          : {config.OUTPUT_FILE}")
@@ -1487,6 +1498,8 @@ def main_territory():
     print(f"    OK             : {sum(1 for z in zone_summary if z['status']=='OK')}")
     if overloaded:
         print(f"    OVERLOADED     : {len(overloaded)} ({', '.join(z['zone'] for z in overloaded)})")
+    if above_target:
+        print(f"    ABOVE TARGET   : {len(above_target)} ({', '.join(z['zone'] for z in above_target)})")
     if light:
         print(f"    LIGHT (<3 stop): {len(light)} ({', '.join(z['zone'] for z in light)})")
     if no_orders:

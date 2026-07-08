@@ -26,13 +26,15 @@ warnings.filterwarnings("ignore")
 # Special zones defined in config are always excluded from clustering
 try:
     import config
-    SPECIAL_ZONES = config.SPECIAL_ZONES
-    DEPOT_LAT     = config.DEPOT_LAT
-    DEPOT_LON     = config.DEPOT_LON
+    SPECIAL_ZONES     = config.SPECIAL_ZONES
+    DEPOT_LAT         = config.DEPOT_LAT
+    DEPOT_LON         = config.DEPOT_LON
+    MAX_STOPS_PER_DAY = config.MAX_STOPS_PER_DAY
 except Exception:
-    SPECIAL_ZONES = {}
-    DEPOT_LAT     = 42.005
-    DEPOT_LON     = 21.435
+    SPECIAL_ZONES     = {}
+    DEPOT_LAT         = 42.005
+    DEPOT_LON         = 21.435
+    MAX_STOPS_PER_DAY = 12
 
 # Total days in the historical dataset window (used for expected daily frequency)
 _DATASET_DAYS = None
@@ -246,24 +248,45 @@ def build_zones(history_df: pd.DataFrame, fleet_df: pd.DataFrame,
     if mode == "auto":
         auto_zone_counts = {}
         fleet_recommendation = {}
+        mask_ns = cust["special_zone"].isna()
         for vtype in ["Kamion", "Furgon", "Van"]:
-            mask_ns = cust["special_zone"].isna()
-            sub_coords = cust.loc[mask_ns & (cust["dom_type"] == vtype),
-                                  ["latitude","longitude"]].values
+            type_mask  = mask_ns & (cust["dom_type"] == vtype)
+            sub_coords = cust.loc[type_mask, ["latitude","longitude"]].values
+            n_fleet    = len(fl_regular[fl_regular["vehicle_type"] == vtype])
+
+            total_p75_stops = float(cust.loc[type_mask, "p75_freq"].sum())
+            workload_min_zones = max(1, int(np.ceil(total_p75_stops / MAX_STOPS_PER_DAY)))
+            shortfall = 0
+
             if len(sub_coords) < 6:
                 auto_zone_counts[vtype] = 1
+            elif workload_min_zones > n_fleet:
+                # Workload needs more zones than vehicles of this type exist —
+                # can't search past n_fleet (1 zone == 1 vehicle always). Use
+                # every available vehicle as its own zone; that's trivially
+                # optimal here. n_fleet may be 0, which is handled downstream
+                # (empty vehicle list → customers fall to the unmatched path).
+                auto_zone_counts[vtype] = n_fleet
+                shortfall = workload_min_zones - n_fleet
             else:
-                n_fleet = len(fl_regular[fl_regular["vehicle_type"] == vtype])
                 auto_zone_counts[vtype] = find_optimal_zones(
                     sub_coords,
-                    min_zones=max(2, n_fleet // 3),
+                    min_zones=max(2, workload_min_zones),
                     max_zones=n_fleet
                 )
+
             fleet_recommendation[vtype] = {
                 "natural_zones":      auto_zone_counts[vtype],
-                "fleet_available":    len(fl_regular[fl_regular["vehicle_type"] == vtype]),
-                "recommended_float":  max(0, len(fl_regular[fl_regular["vehicle_type"] == vtype])
-                                          - auto_zone_counts[vtype]),
+                "fleet_available":    n_fleet,
+                "recommended_float":  max(0, n_fleet - auto_zone_counts[vtype]),
+                "workload_min_zones": workload_min_zones,
+                "fleet_shortfall":    shortfall,
+                "shortfall_msg": (
+                    f"Workload needs ~{workload_min_zones} zones (at {MAX_STOPS_PER_DAY} "
+                    f"stops/day cap) but only {n_fleet} {vtype} vehicle(s) available — "
+                    f"{shortfall} short. Add vehicles, raise the stop cap, or plan for "
+                    f"overflow via Float/other types."
+                ) if shortfall > 0 else "",
             }
         # Build type_counts using auto zone count — assign first N vehicles to zones
         type_counts = {}

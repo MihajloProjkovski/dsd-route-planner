@@ -273,7 +273,8 @@ if page == "🗺 Route Planning":
             df_zs = pd.DataFrame(zs)[["vehicle","zone","orig_stops","stops","kg","status"]].copy()
             df_zs.columns = ["Vehicle","Zone","Original","Final","KG","Status"]
             def _color(row):
-                c = {"OVERLOADED":"background-color:#FFDDC1","LIGHT":"background-color:#FFFACD",
+                c = {"OVERLOADED":"background-color:#FFDDC1","ABOVE TARGET":"background-color:#FDEBD0",
+                     "LIGHT":"background-color:#FFFACD",
                      "NO ORDERS":"background-color:#E8E8E8"}.get(row["Status"],"")
                 return [c]*len(row)
             st.dataframe(df_zs.style.apply(_color, axis=1),
@@ -528,15 +529,24 @@ elif page == "⚙️ Admin":
                 rc1, rc2, rc3 = st.columns(3)
                 for col, vtype in zip([rc1, rc2, rc3], ["Kamion", "Furgon", "Van"]):
                     rec = fleet_rec.get(vtype, {})
+                    shortfall = rec.get("fleet_shortfall", 0)
                     col.metric(
                         vtype,
                         f"{rec.get('natural_zones', '?')} zones",
-                        delta=f"{rec.get('recommended_float', 0)} Float" if rec.get("recommended_float", 0) > 0 else "No overflow",
-                        delta_color="off",
+                        delta=(f"{shortfall} short" if shortfall > 0
+                               else (f"{rec.get('recommended_float', 0)} Float"
+                                     if rec.get("recommended_float", 0) > 0 else "No overflow")),
+                        delta_color="inverse" if shortfall > 0 else "off",
                         help=f"Fleet available: {rec.get('fleet_available','?')}  |  "
+                             f"Workload needs: {rec.get('workload_min_zones','?')} zones  |  "
                              f"Natural zones: {rec.get('natural_zones','?')}  |  "
                              f"Recommended Float: {rec.get('recommended_float','?')}"
                     )
+                shortfalls = [rec["shortfall_msg"] for rec in fleet_rec.values()
+                              if rec.get("fleet_shortfall", 0) > 0]
+                if shortfalls:
+                    st.warning("**Fleet capacity shortfall detected:**\n\n" +
+                               "\n\n".join(f"- {m}" for m in shortfalls))
 
             # Quality score
             q = st.session_state.get("zb_quality", {})

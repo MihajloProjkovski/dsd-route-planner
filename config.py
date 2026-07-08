@@ -39,7 +39,12 @@ KAMION_ELIGIBLE_FROM_VAN_PCT    = 15
 FURGON_ELIGIBLE_FROM_VAN_PCT    = 15
 
 # â”€â”€ Stop count cap â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-MAX_STOPS_PER_DAY = 12
+MAX_STOPS_PER_DAY      = 12       # soft target: zone-builder workload divisor,
+                                   # solver's soft-cap bound, straggler-rebalance donee limit
+MAX_STOPS_PER_DAY_HARD  = 15      # hard ceiling: solver will never exceed this per vehicle/day
+STOP_COUNT_SOFT_PENALTY = 10_000  # meter-equivalent cost per stop over MAX_STOPS_PER_DAY
+STOP_COUNT_SPAN_COEFF   = 15_000  # meter-equivalent span-cost coeff for balancing stop-count
+                                   # spread across vehicles
 
 # â”€â”€ Geo clustering (used by build_customer_master.py) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 # Cluster counts are derived dynamically from the Vehicles sheet at build time.

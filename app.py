@@ -521,6 +521,9 @@ elif page == "⚙️ Admin":
 
             st.markdown("---")
             st.success(f"✅ Zones built for **{len(updated):,}** customers across **{len(zone_summary)}** zones.")
+            zone_type_counts = pd.Series([z["vehicle_type"] for z in zone_summary]).value_counts()
+            st.caption(" | ".join(f"**{vt}**: {zone_type_counts.get(vt, 0)} zones"
+                                  for vt in ["Kamion", "Furgon", "Van"]))
 
             # Auto mode: show fleet recommendation
             if run_mode == "auto" and fleet_rec:

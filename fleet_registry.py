@@ -35,6 +35,7 @@ try:
     URBAN_ZONE_RADIUS_KM   = config.URBAN_ZONE_RADIUS_KM
     RURAL_ZONE_RADIUS_KM   = config.RURAL_ZONE_RADIUS_KM
     URBAN_CORE_RADIUS_KM   = config.URBAN_CORE_RADIUS_KM
+    ZONE_CROSS_TYPE_ELIGIBLE_PCT = config.ZONE_CROSS_TYPE_ELIGIBLE_PCT
 except Exception:
     SPECIAL_ZONES          = {}
     DEPOT_LAT              = 42.005
@@ -45,6 +46,7 @@ except Exception:
     URBAN_ZONE_RADIUS_KM   = 1.5
     RURAL_ZONE_RADIUS_KM   = 2.0
     URBAN_CORE_RADIUS_KM   = 6.0
+    ZONE_CROSS_TYPE_ELIGIBLE_PCT = 70
 
 # Total days in the historical dataset window (used for expected daily frequency)
 _DATASET_DAYS = None
@@ -659,6 +661,8 @@ def build_zones(history_df: pd.DataFrame, fleet_df: pd.DataFrame,
         zone_summary.append({
             "zone":              zone_name,
             "vehicle_type":      vtype,
+            "centroid_lat":      round(float(zdf["latitude"].mean()), 6),
+            "centroid_lon":      round(float(zdf["longitude"].mean()), 6),
             "customers":         n_cust,
             "exp_daily_stops":   round(exp_daily_stops, 1),
             "p75_daily_stops":   round(p75_daily_stops, 1),
@@ -757,6 +761,186 @@ def build_zones(history_df: pd.DataFrame, fleet_df: pd.DataFrame,
     }
 
     return updated, zone_summary, map_html, quality, _auto_recommendation
+
+
+def _empty_suggestion(unclaimed=None):
+    unclaimed = unclaimed or []
+    return {
+        "vehicle_zone_map":      {},
+        "zone_vehicle_map":      {z: None for z in unclaimed},
+        "unclaimed_zones":       list(unclaimed),
+        "cross_type_assists":    [],
+        "zone_assignments":      [],
+        "special_zone_vehicles": {},
+    }
+
+
+def suggest_fleet_assignment(updated: pd.DataFrame, zone_summary: list,
+                             fleet_df: pd.DataFrame, cross_type: bool = True,
+                             cross_type_eligible_pct: float | None = None) -> dict:
+    """
+    Greedy, capacitated, nearest-neighbour suggestion for which vehicle should
+    cover each zone that build_zones() left without a dedicated vehicle. A
+    vehicle can be suggested for multiple zones (packed busiest-first, capped
+    by its daily_cap_kg and MAX_STOPS_PER_DAY). When cross_type, a zone whose
+    own vehicle type is out of capacity can be offered to a different type,
+    but only if enough of that zone's customers list it in eligible_vehicles.
+    Pure recommendation — does not modify zones or touch the live solver.
+    """
+    # ── Setup: normalize fleet, re-derive special-vehicle exclusion ──
+    fl = fleet_df.copy()
+    fl.columns = fl.columns.str.strip().str.lower()
+    fl["vehicle_name"]      = fl["vehicle_name"].astype(str).str.strip()
+    fl["vehicle_type"]      = fl["vehicle_type"].astype(str).str.strip()
+    fl["capacity_kg"]       = pd.to_numeric(fl["capacity_kg"],       errors="coerce").fillna(3_200)
+    fl["max_trips_per_day"] = pd.to_numeric(fl["max_trips_per_day"], errors="coerce").fillna(2).astype(int)
+    fl["daily_cap_kg"]      = fl["capacity_kg"] * fl["max_trips_per_day"]
+
+    fleet_vehicle_names = set(fl["vehicle_name"])
+    special_veh_names, special_zone_vehicles = set(), {}
+    for sz_name, sz_def in SPECIAL_ZONES.items():
+        ptype = sz_def.get("primary_vehicle", "Van")
+        match = fl[fl["vehicle_type"] == ptype].head(1)
+        if not match.empty:
+            vname = match.iloc[0]["vehicle_name"]
+            special_veh_names.add(vname)
+            special_zone_vehicles[vname] = sz_name
+    fl_candidates = fl[~fl["vehicle_name"].isin(special_veh_names)].copy()
+    threshold = (cross_type_eligible_pct if cross_type_eligible_pct is not None
+                 else ZONE_CROSS_TYPE_ELIGIBLE_PCT) / 100.0
+
+    # ── Zone records: skip already-resolved zones (special zones + fleet-mode 1:1) ──
+    zone_records = []
+    for z in zone_summary:
+        if z["zone"] in fleet_vehicle_names:
+            continue
+        zone_records.append({
+            "zone": z["zone"], "home_type": z["vehicle_type"],
+            "centroid_lat": float(z["centroid_lat"]), "centroid_lon": float(z["centroid_lon"]),
+            "p75_stops": float(z.get("p75_daily_stops", 0) or 0),
+            "p75_kg":    float(z.get("p75_daily_kg", 0) or 0),
+        })
+    if not zone_records:
+        return _empty_suggestion()
+
+    # ── Vehicle records ──
+    vehicles = {
+        row["vehicle_name"]: {
+            "vehicle_type": row["vehicle_type"], "daily_cap_kg": float(row["daily_cap_kg"]),
+            "used_kg": 0.0, "used_stops": 0.0,
+            "anchor_lat": DEPOT_LAT, "anchor_lon": DEPOT_LON, "anchor_weight": 0.0,
+            "assigned_zones": [],
+        }
+        for _, row in fl_candidates.iterrows()
+    }
+    if not vehicles:
+        return _empty_suggestion(unclaimed=[z["zone"] for z in zone_records])
+
+    # ── Cross-type eligibility precompute (once, not per zone/type) ──
+    eligible_sets_by_zone = {}
+    if cross_type:
+        from collections import defaultdict
+        eligible_sets_by_zone = defaultdict(list)
+        needed = {zr["zone"] for zr in zone_records}
+        upd = updated.copy()
+        upd.columns = upd.columns.str.strip().str.lower()
+        for _, row in upd.iterrows():
+            z = row.get("zone")
+            if z not in needed:
+                continue
+            raw = row.get("eligible_vehicles")
+            elig = ({x.strip() for x in str(raw).split(",") if x.strip()}
+                    if not pd.isna(raw) and str(raw).strip()
+                    else set(config.NEW_CUSTOMER_DEFAULT_VEHICLES))
+            eligible_sets_by_zone[z].append(elig)
+
+    def eligible_fraction(zone_name, candidate_type):
+        sets = eligible_sets_by_zone.get(zone_name, [])
+        return (sum(1 for s in sets if candidate_type in s) / len(sets)) if sets else 0.0
+
+    def pick_nearest(zone_rec, candidate_names):
+        feasible = []
+        for vn in candidate_names:
+            v = vehicles[vn]
+            if v["used_kg"] + zone_rec["p75_kg"] > v["daily_cap_kg"]:
+                continue
+            if v["used_stops"] + zone_rec["p75_stops"] > MAX_STOPS_PER_DAY:
+                continue
+            d = haversine_km(v["anchor_lat"], v["anchor_lon"],
+                              zone_rec["centroid_lat"], zone_rec["centroid_lon"])
+            feasible.append((d, -(v["daily_cap_kg"] - v["used_kg"]), len(v["assigned_zones"]), vn))
+        if not feasible:
+            return None
+        feasible.sort()
+        return feasible[0][3]
+
+    assignments = []
+
+    def assign(zone_rec, vname, pass_no, cross=False, eligible_pct=None):
+        v = vehicles[vname]
+        d = haversine_km(v["anchor_lat"], v["anchor_lon"],
+                          zone_rec["centroid_lat"], zone_rec["centroid_lon"])
+        v["used_kg"] += zone_rec["p75_kg"]
+        v["used_stops"] += zone_rec["p75_stops"]
+        v["assigned_zones"].append(zone_rec["zone"])
+        # incremental workload-weighted running centroid; 1kg floor avoids
+        # divide-by-zero / a frozen anchor on a zero-weight ("very light") zone
+        w = max(zone_rec["p75_kg"], 1.0)
+        v["anchor_lat"] = (v["anchor_lat"] * v["anchor_weight"] + zone_rec["centroid_lat"] * w) / (v["anchor_weight"] + w)
+        v["anchor_lon"] = (v["anchor_lon"] * v["anchor_weight"] + zone_rec["centroid_lon"] * w) / (v["anchor_weight"] + w)
+        v["anchor_weight"] += w
+        assignments.append({
+            "zone": zone_rec["zone"], "home_type": zone_rec["home_type"],
+            "vehicle": vname, "vehicle_type": v["vehicle_type"],
+            "pass": pass_no, "cross_type": cross,
+            "eligible_pct": round(eligible_pct, 1) if eligible_pct is not None else None,
+            "distance_km": round(d, 2), "p75_kg": zone_rec["p75_kg"],
+        })
+
+    # ── Pass 1: same-type, busiest zones first ──
+    for vtype in ["Kamion", "Furgon", "Van"]:
+        zones_t = sorted((zr for zr in zone_records if zr["home_type"] == vtype),
+                         key=lambda z: (-z["p75_stops"], -z["p75_kg"], z["zone"]))
+        candidates_t = [vn for vn, v in vehicles.items() if v["vehicle_type"] == vtype]
+        for zr in zones_t:
+            picked = pick_nearest(zr, candidates_t)
+            if picked:
+                assign(zr, picked, pass_no=1)
+
+    # ── Pass 2: cross-type, remaining zones compete for a shared pool ──
+    if cross_type:
+        assigned = {a["zone"] for a in assignments}
+        remaining = sorted((zr for zr in zone_records if zr["zone"] not in assigned),
+                           key=lambda z: (-z["p75_stops"], -z["p75_kg"], z["zone"]))
+        for zr in remaining:
+            qualifying = [t for t in ("Kamion", "Furgon", "Van")
+                         if t != zr["home_type"] and eligible_fraction(zr["zone"], t) >= threshold]
+            if not qualifying:
+                continue
+            pool = [vn for vn, v in vehicles.items() if v["vehicle_type"] in qualifying]
+            picked = pick_nearest(zr, pool)
+            if picked:
+                assign(zr, picked, pass_no=2, cross=True,
+                       eligible_pct=eligible_fraction(zr["zone"], vehicles[picked]["vehicle_type"]) * 100)
+
+    # ── Build return, sorting each vehicle's zones busiest-first (for "primary zone" use) ──
+    assigned_names = {a["zone"] for a in assignments}
+    unclaimed_zones = sorted(z["zone"] for z in zone_records if z["zone"] not in assigned_names)
+    vehicle_zone_map = {}
+    for a in sorted(assignments, key=lambda a: -a["p75_kg"]):
+        vehicle_zone_map.setdefault(a["vehicle"], []).append(a["zone"])
+    zone_vehicle_map = {a["zone"]: a["vehicle"] for a in assignments}
+    for z in unclaimed_zones:
+        zone_vehicle_map[z] = None
+
+    return {
+        "vehicle_zone_map":      vehicle_zone_map,
+        "zone_vehicle_map":      zone_vehicle_map,
+        "unclaimed_zones":       unclaimed_zones,
+        "cross_type_assists":    [a for a in assignments if a["cross_type"]],
+        "zone_assignments":      assignments,
+        "special_zone_vehicles": special_zone_vehicles,
+    }
 
 
 # ── Map builder ────────────────────────────────────────────────────────────────

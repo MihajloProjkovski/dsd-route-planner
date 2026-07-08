@@ -99,6 +99,65 @@ def make_blank_template() -> bytes:
     return buf.getvalue()
 
 
+def build_suggested_vehicles_excel(fleet_df: pd.DataFrame, suggestion: dict) -> bytes:
+    """Vehicles-sheet-shaped Excel, zone column pre-filled from
+    fr.suggest_fleet_assignment()'s output. Only each vehicle's busiest
+    suggested zone goes in the zone cell (today's solver matches one zone
+    per vehicle); any additional suggested zones are listed in notes."""
+    HDR_FILL = PatternFill("solid", fgColor="1F4E79")
+    HDR_FONT = Font(color="FFFFFF", bold=True)
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "Vehicles"
+    headers = ["vehicle_name", "vehicle_type", "capacity_kg",
+               "zone", "available", "max_trips_per_day", "notes"]
+    ws.append(headers)
+    for cell in ws[1]:
+        cell.fill = HDR_FILL; cell.font = HDR_FONT
+        cell.alignment = Alignment(horizontal="center")
+
+    vzmap   = suggestion["vehicle_zone_map"]     # already sorted busiest-first
+    special = suggestion["special_zone_vehicles"]
+    cross_by_zone = {a["zone"]: a for a in suggestion["cross_type_assists"]}
+
+    fl = fleet_df.dropna(subset=["vehicle_name"])
+    fl = fl[fl["vehicle_name"].astype(str).str.len() > 2]
+    fl = fl[~fl["vehicle_name"].astype(str).str.startswith("HOW")]
+
+    for _, row in fl.iterrows():
+        vname = str(row["vehicle_name"]).strip()
+        note  = ""
+        if vname in special:
+            zone_val = vname
+            note = f"Special zone: {special[vname]}"
+        else:
+            zones = vzmap.get(vname, [])   # busiest-first
+            if zones:
+                zone_val = zones[0]        # PRIMARY zone only — real solver affinity today
+                extra = zones[1:]
+                notes_parts = []
+                if extra:
+                    notes_parts.append(f"Also suggested for: {', '.join(extra)} "
+                                       f"(not yet in zone cell — today's solver matches one "
+                                       f"zone per vehicle; combine manually if desired)")
+                if zone_val in cross_by_zone:
+                    notes_parts.append(f"Cross-type suggestion ({cross_by_zone[zone_val]['eligible_pct']:.0f}% "
+                                       f"of zone's customers eligible)")
+                note = " | ".join(notes_parts)
+            else:
+                zone_val = "Float"
+        ws.append([vname, row.get("vehicle_type", ""), row.get("capacity_kg", ""),
+                  zone_val, "TRUE", row.get("max_trips_per_day", ""), note])
+
+    for col_letter, w in zip(["A","B","C","D","E","F","G"], [20,12,14,16,12,18,55]):
+        ws.column_dimensions[col_letter].width = w
+    ws.freeze_panes = "A2"
+    buf = io.BytesIO()
+    wb.save(buf)
+    buf.seek(0)
+    return buf.getvalue()
+
+
 def run_routing(file_bytes: bytes, mode: str):
     with open(config.TODAY_FILE, "wb") as f:
         f.write(file_bytes)
@@ -508,7 +567,9 @@ elif page == "⚙️ Admin":
                             "zb_quality":    quality,
                             "zb_fleet_rec":  fleet_rec,
                             "zb_mode":       build_mode,
+                            "zb_fleet_df":   fl_df,
                         })
+                        st.session_state.pop("zb_suggestion", None)
                     except Exception as e:
                         st.error(f"Zone building failed: {e}")
 
@@ -551,6 +612,56 @@ elif page == "⚙️ Admin":
                     st.info("**Zone / fleet coverage:**\n\n" +
                             "\n\n".join(f"- {m}" for m in coverage_msgs))
 
+                # Suggested vehicle assignment
+                st.markdown("#### Suggested Vehicle Assignment")
+                st.caption(
+                    "Greedy nearest-neighbour suggestion for which vehicle should cover each "
+                    "unclaimed zone (a vehicle can cover multiple zones). Cross-type assists (⚡) "
+                    "are only offered when enough of the zone's customers are eligible for that "
+                    "vehicle type."
+                )
+                if st.button("🚚 Suggest Vehicle Assignments"):
+                    with st.spinner("Assigning zones to vehicles..."):
+                        try:
+                            suggestion = fr.suggest_fleet_assignment(
+                                updated, zone_summary, st.session_state["zb_fleet_df"],
+                                cross_type=True,
+                            )
+                            st.session_state["zb_suggestion"] = suggestion
+                        except Exception as e:
+                            st.error(f"Suggestion failed: {e}")
+
+                if "zb_suggestion" in st.session_state:
+                    sug = st.session_state["zb_suggestion"]
+                    n_total     = len(sug["zone_vehicle_map"])
+                    n_unclaimed = len(sug["unclaimed_zones"])
+                    n_cross     = len(sug["cross_type_assists"])
+                    sc1, sc2, sc3 = st.columns(3)
+                    sc1.metric("Zones suggested", f"{n_total - n_unclaimed}/{n_total}" if n_total else "0/0")
+                    sc2.metric("Cross-type assists", n_cross)
+                    sc3.metric("Still unclaimed", n_unclaimed)
+
+                    if sug["cross_type_assists"]:
+                        st.markdown("**Cross-Type Assignments (review closely)**")
+                        df_cross = pd.DataFrame(sug["cross_type_assists"])[
+                            ["zone", "home_type", "vehicle", "vehicle_type", "eligible_pct", "distance_km"]
+                        ]
+                        df_cross.columns = ["Zone", "Home Type", "Vehicle", "Assigned Type",
+                                             "Customer Eligible %", "Distance (km)"]
+                        st.dataframe(df_cross, use_container_width=True, hide_index=True)
+
+                    st.caption(
+                        "Vehicles suggested for multiple zones list only their busiest zone in "
+                        "the download's `zone` cell (so it gets real solver zone-affinity today); "
+                        "additional suggested zones are listed in `notes` for manual follow-up."
+                    )
+                    st.download_button(
+                        "⬇  Download suggested Vehicles sheet (today.xlsx-ready)",
+                        build_suggested_vehicles_excel(st.session_state["zb_fleet_df"], sug),
+                        file_name="today_vehicles_suggested.xlsx",
+                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    )
+
             # Quality score
             q = st.session_state.get("zb_quality", {})
             if q:
@@ -589,6 +700,18 @@ elif page == "⚙️ Admin":
             st.caption("Avg = mean day stops · P75 = busy day stops (1-in-4) · Utilisation based on P75 demand")
             st.caption("✅ OK  🟡 Heavy on busy days (>70%)  ⚠️ Overloaded on busy days (>90%)  💤 Very light")
             df_raw = pd.DataFrame(zone_summary)
+            sug = st.session_state.get("zb_suggestion")
+            if sug:
+                zvm = sug["zone_vehicle_map"]
+                cross_zones = {a["zone"] for a in sug["cross_type_assists"]}
+                def _fmt_suggestion(zone_name):
+                    v = zvm.get(zone_name)
+                    if v:
+                        return f"{v} ⚡" if zone_name in cross_zones else v
+                    if zone_name in sug["unclaimed_zones"]:
+                        return "⚠️ none found"
+                    return "— already dedicated —"
+                df_raw["suggested_vehicle"] = df_raw["zone"].apply(_fmt_suggestion)
             # Build column list defensively — p75 columns may be absent in old results
             has_p75 = "p75_daily_stops" in df_raw.columns
             base_cols  = ["zone","vehicle_type","customers","exp_daily_stops","exp_daily_kg",
@@ -603,6 +726,9 @@ elif page == "⚙️ Admin":
                              "Avg KG/Day","Trip Cap (kg)","P75 Utilisation %","Status"]
             else:
                 sel_cols, sel_names = base_cols, base_names
+            if sug:
+                sel_cols  = sel_cols  + ["suggested_vehicle"]
+                sel_names = sel_names + ["Suggested Vehicle"]
             df_sum = df_raw[[c for c in sel_cols if c in df_raw.columns]].copy()
             df_sum.columns = sel_names[:len(df_sum.columns)]
 
@@ -626,7 +752,7 @@ elif page == "⚙️ Admin":
             components.html(map_html, height=600, scrolling=False)
 
             if st.button("🗑  Clear Results"):
-                for k in ["zb_updated","zb_summary","zb_map"]:
+                for k in ["zb_updated","zb_summary","zb_map","zb_suggestion","zb_fleet_df"]:
                     st.session_state.pop(k, None)
                 st.rerun()
 

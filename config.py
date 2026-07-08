@@ -37,6 +37,9 @@ NEW_CUSTOMER_DEFAULT_VEHICLES = ["Kamion", "Van"]
 FURGON_ELIGIBLE_FROM_KAMION_PCT = 10
 KAMION_ELIGIBLE_FROM_VAN_PCT    = 15
 FURGON_ELIGIBLE_FROM_VAN_PCT    = 15
+ZONE_CROSS_TYPE_ELIGIBLE_PCT    = 70  # suggest_fleet_assignment(): min % of a zone's customers
+                                       # that must list a candidate OTHER vehicle type in
+                                       # eligible_vehicles before that zone is offered to it.
 
 # â”€â”€ Stop count cap â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 MAX_STOPS_PER_DAY      = 12       # soft target: zone-builder workload divisor,

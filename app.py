@@ -539,7 +539,9 @@ elif page == "⚙️ Admin":
                         delta_color="inverse" if shortfall > 0 else "off",
                         help=f"Fleet available: {rec.get('fleet_available','?')}  |  "
                              f"Workload needs: {rec.get('workload_min_zones','?')} zones  |  "
+                             f"Customer-count needs: {rec.get('customer_min_zones','?')} zones  |  "
                              f"Natural zones: {rec.get('natural_zones','?')}  |  "
+                             f"Avg zone radius: {rec.get('achieved_avg_radius_km') if rec.get('achieved_avg_radius_km') is not None else '?'} km  |  "
                              f"Recommended Float: {rec.get('recommended_float','?')}"
                     )
                 shortfalls = [rec["shortfall_msg"] for rec in fleet_rec.values()
@@ -547,6 +549,11 @@ elif page == "⚙️ Admin":
                 if shortfalls:
                     st.warning("**Fleet capacity shortfall detected:**\n\n" +
                                "\n\n".join(f"- {m}" for m in shortfalls))
+                radius_warnings = [rec["radius_shortfall_msg"] for rec in fleet_rec.values()
+                                    if rec.get("radius_shortfall_msg")]
+                if radius_warnings:
+                    st.warning("**Zones still geographically spread out:**\n\n" +
+                               "\n\n".join(f"- {m}" for m in radius_warnings))
 
             # Quality score
             q = st.session_state.get("zb_quality", {})

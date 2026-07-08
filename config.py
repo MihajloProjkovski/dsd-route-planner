@@ -46,6 +46,12 @@ STOP_COUNT_SOFT_PENALTY = 10_000  # meter-equivalent cost per stop over MAX_STOP
 STOP_COUNT_SPAN_COEFF   = 15_000  # meter-equivalent span-cost coeff for balancing stop-count
                                    # spread across vehicles
 
+# ── Zone geographic compactness (auto mode) ─────────────────────────────
+MAX_CUSTOMERS_PER_ZONE = 60   # customer-count floor: min_zones >= ceil(n_cust / this)
+MAX_ZONE_RADIUS_KM     = 3.5  # target avg customer-to-zone-centroid radius (km);
+                               # anchored near the existing 3.0 km _SA_MAX_EXTRA_KM
+                               # guard and the 5 km denominator in compact_score
+
 # â”€â”€ Geo clustering (used by build_customer_master.py) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 # Cluster counts are derived dynamically from the Vehicles sheet at build time.
 # These are fallback counts used only when no vehicles file is present.

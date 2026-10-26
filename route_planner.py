@@ -88,7 +88,10 @@ def load_orders(today_path, master_path):
     if not os.path.exists(today_path):
         sys.exit(f"\nERROR: '{today_path}' not found.\n  Fill the Orders sheet and save.")
     if not os.path.exists(master_path):
-        sys.exit(f"\nERROR: '{master_path}' not found.\n  Run _setup/run_setup.bat to rebuild.")
+        sys.exit(
+            f"\nERROR: '{master_path}' not found.\n"
+            "  Build and activate a customer master in Admin > Zone Builder."
+        )
 
     xl     = pd.ExcelFile(today_path)
     if "Orders" not in xl.sheet_names:
@@ -163,7 +166,10 @@ def load_vehicles(today_path):
     veh = veh.dropna(subset=["vehicle_name"])
     veh["vehicle_name"] = veh["vehicle_name"].astype(str).str.strip()
     veh["vehicle_type"] = veh["vehicle_type"].astype(str).str.strip()
-    veh["zone"]         = veh["zone"].fillna("Float").astype(str).str.strip()
+    if "zone" in veh.columns:
+        veh["zone"] = veh["zone"].fillna("Float").astype(str).str.strip()
+    else:
+        veh["zone"] = "Float"
 
     def parse_bool(v):
         if v is None: return False
@@ -189,7 +195,84 @@ def load_vehicles(today_path):
     return available
 
 
+def _assign_daily_zone_affinities(stops_df, vehicles_df):
+    """Assign today's busiest compatible zones to available vehicles."""
+    vehicles = vehicles_df.copy()
+    vehicles["zone"] = "Float"
+    if "zone" not in stops_df.columns or stops_df.empty:
+        return vehicles
+
+    zone_records = []
+    for zone, group in stops_df.groupby("zone", sort=True):
+        zone_name = str(zone).strip()
+        if not zone_name or zone_name.lower() in ("nan", "unknown", "none"):
+            continue
+        eligible_counts = {}
+        for raw_types in group["eligible_vehicles"].fillna("").astype(str):
+            for vehicle_type in raw_types.split(","):
+                vehicle_type = vehicle_type.strip()
+                if vehicle_type:
+                    eligible_counts[vehicle_type] = eligible_counts.get(vehicle_type, 0) + 1
+        preferred = group.get(
+            "preferred_vehicle",
+            pd.Series("", index=group.index),
+        ).fillna("").astype(str).str.strip()
+        preferred_counts = preferred.value_counts()
+        preferred_kg = group.assign(_preferred=preferred).groupby("_preferred")["kg"].sum()
+        total_zone_kg = max(float(group["kg"].sum()), 1.0)
+        type_scores = {
+            vehicle_type: 0.5 * count / max(1, len(group))
+            + 0.5 * float(preferred_kg.get(vehicle_type, 0)) / total_zone_kg
+            for vehicle_type, count in preferred_counts.items()
+            if vehicle_type
+        }
+        preferred_type = (
+            sorted(type_scores, key=lambda value: (-type_scores[value], value))[0]
+            if type_scores else ""
+        )
+        zone_records.append({
+            "zone": zone_name,
+            "stops": len(group),
+            "kg": float(group["kg"].sum()),
+            "eligible_counts": eligible_counts,
+            "preferred_type": preferred_type,
+        })
+    zone_records.sort(key=lambda item: (-item["kg"], -item["stops"], item["zone"]))
+
+    used_vehicles = set()
+    for zone in zone_records:
+        candidates = []
+        for index, vehicle in vehicles.iterrows():
+            if index in used_vehicles:
+                continue
+            eligible_count = zone["eligible_counts"].get(vehicle["vehicle_type"], 0)
+            if eligible_count == 0:
+                continue
+            eligible_share = eligible_count / max(zone["stops"], 1)
+            daily_capacity = (
+                float(vehicle.get("capacity_kg", 0) or 0)
+                * max(1, int(vehicle.get("max_trips_per_day", 1) or 1))
+            )
+            capacity_fit = min(daily_capacity / max(zone["kg"], 1.0), 1.0)
+            candidates.append((
+                -eligible_share,
+                0 if vehicle["vehicle_type"] == zone["preferred_type"] else 1,
+                -capacity_fit,
+                -daily_capacity,
+                str(vehicle["vehicle_name"]),
+                index,
+            ))
+        if candidates:
+            chosen = min(candidates)[-1]
+            vehicles.at[chosen, "zone"] = zone["zone"]
+            used_vehicles.add(chosen)
+    return vehicles
+
+
 def solve(stops_df, vehicles_df, zone_affinity=False):
+    if zone_affinity:
+        vehicles_df = _assign_daily_zone_affinities(stops_df, vehicles_df)
+
     depot     = (config.DEPOT_LAT, config.DEPOT_LON)
     stop_locs = list(zip(stops_df["latitude"], stops_df["longitude"]))
     locations = [depot] + stop_locs
@@ -672,7 +755,7 @@ def solve_territory(stops_df, vehicles_df):
             # Explicit Float — no dedicated zone, serves as overflow
             float_vehs[vname] = veh.to_dict()
             continue
-        # Any other zone value (including zone = vehicle name) is a real zone
+        # Customer zones are geographic; vehicle zones are assigned for today's workload.
         for z in [x.strip() for x in z_raw.split(",") if x.strip()]:
             if z.lower() not in ("float", "none", "nan"):
                 zone_to_veh[z] = veh.to_dict()
@@ -1430,20 +1513,11 @@ def main_territory():
 
     total_kg    = stops_df["kg"].sum()
     n_veh       = len(vehicles_df)
-    n_with_zone = int((~vehicles_df["zone"].str.lower()
-                       .isin(["", "nan", "float", "none"])).sum())
 
     print(f"\n  Stops ordered   : {len(stops_df)}")
     print(f"  Total KG        : {total_kg:,.1f}")
     print(f"  Vehicles avail  : {n_veh}")
-    print(f"  Vehicles w/zone : {n_with_zone}")
     print(f"  Zone penalty    : {config.ZONE_AFFINITY_PENALTY_KM} km equivalent")
-
-    if n_with_zone == 0:
-        sys.exit(
-            "\n  ERROR: No vehicles have a zone assigned in today.xlsx.\n"
-            "  Run suggest_zones.bat first."
-        )
 
     # Pre-compute how many of today's stops belong to each vehicle's zone
     vehicle_zones = {}

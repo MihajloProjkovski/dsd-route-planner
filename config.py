@@ -27,40 +27,21 @@ ROAD_FACTOR        = 1.3
 AVG_SERVICE_MIN    = 12
 SOLVER_TIME_LIMIT_SECONDS = 480
 
-# â”€â”€ Zone affinity (SMART mode) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-# Penalty when solver assigns a stop outside its home vehicle zone.
+# Penalty when solver assigns a stop outside its initially assigned zone.
 # In km-equivalent. 20 km suits Skopje (~15 km city diameter).
 ZONE_AFFINITY_PENALTY_KM = 20
 
 # â”€â”€ Customer eligibility thresholds â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 NEW_CUSTOMER_DEFAULT_VEHICLES = ["Kamion", "Van"]
-FURGON_ELIGIBLE_FROM_KAMION_PCT = 10
-KAMION_ELIGIBLE_FROM_VAN_PCT    = 15
-FURGON_ELIGIBLE_FROM_VAN_PCT    = 15
-ZONE_CROSS_TYPE_ELIGIBLE_PCT    = 70  # suggest_fleet_assignment(): min % of a zone's customers
-                                       # that must list a candidate OTHER vehicle type in
-                                       # eligible_vehicles before that zone is offered to it.
 
 # â”€â”€ Stop count cap â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-MAX_STOPS_PER_DAY      = 12       # soft target: zone-builder workload divisor,
-                                   # solver's soft-cap bound, straggler-rebalance donee limit
+MAX_STOPS_PER_DAY      = 12       # solver soft-cap target and straggler-rebalance limit
 MAX_STOPS_PER_DAY_HARD  = 15      # hard ceiling: solver will never exceed this per vehicle/day
 STOP_COUNT_SOFT_PENALTY = 10_000  # meter-equivalent cost per stop over MAX_STOPS_PER_DAY
 STOP_COUNT_SPAN_COEFF   = 15_000  # meter-equivalent span-cost coeff for balancing stop-count
                                    # spread across vehicles
 
-# ── Zone geographic compactness (auto mode) ─────────────────────────────
-MAX_CUSTOMERS_PER_ZONE = 60   # customer-count floor: min_zones >= ceil(n_cust / this)
-MAX_ZONE_RADIUS_KM     = 3.5  # legacy flat target, kept for reference; superseded by
-                               # the urban/rural pair below
-URBAN_ZONE_RADIUS_KM   = 1.5  # per-zone worst-case radius target inside the urban core
-RURAL_ZONE_RADIUS_KM   = 2.0  # per-zone worst-case radius target outside the urban core
-URBAN_CORE_RADIUS_KM   = 6.0  # distance from depot (km) defining "urban" vs "rural"
 
-# â”€â”€ Geo clustering (used by build_customer_master.py) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-# Cluster counts are derived dynamically from the Vehicles sheet at build time.
-# These are fallback counts used only when no vehicles file is present.
-N_CLUSTERS_FALLBACK = {"Kamion": 13, "Furgon": 19, "Van": 10}
 
 # â”€â”€ Special zones (manually defined, override clustering) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 SPECIAL_ZONES = {
@@ -98,8 +79,6 @@ SPECIAL_ZONES = {
 }
 
 # â”€â”€ Files â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-HISTORICAL_FILE = "_setup/Za model.xlsx"
 CUSTOMER_MASTER = "_setup/customer_master.xlsx"
 TODAY_FILE      = "today.xlsx"
 OUTPUT_FILE     = "routes_output.xlsx"
-

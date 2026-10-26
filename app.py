@@ -7,6 +7,7 @@ import os
 import sys
 import time
 import threading
+import hashlib
 from datetime import date
 
 import openpyxl
@@ -21,7 +22,7 @@ if ROOT not in sys.path:
 
 import config
 import route_planner as rp
-import fleet_registry as fr
+import zone_builder as zb
 
 FLEET_FILE = "_setup/fleet.xlsx"
 
@@ -76,82 +77,30 @@ def make_blank_template() -> bytes:
 
     ws_v = wb.create_sheet("Vehicles")
     headers = ["vehicle_name", "vehicle_type", "capacity_kg",
-               "zone", "available", "max_trips_per_day", "notes"]
+               "available", "max_trips_per_day", "notes"]
     ws_v.append(headers)
     for cell in ws_v[1]:
         cell.fill = HDR_FILL; cell.font = HDR_FONT
         cell.alignment = Alignment(horizontal="center")
-    for col_letter, w in zip(["A","B","C","D","E","F","G"], [20,12,14,22,12,18,25]):
+    for col_letter, w in zip(["A","B","C","D","E","F"], [20,12,14,12,18,25]):
         ws_v.column_dimensions[col_letter].width = w
-    ws_v.append([])
-    ws_v.append(["HOW TO FILL:"])
-    ws_v.append(["vehicle_name    -> Your vehicle name/plate (e.g. DSD 1, F 3, Van 7)"])
-    ws_v.append(["vehicle_type    -> Kamion | Furgon | Van"])
-    ws_v.append(["capacity_kg     -> Usable kg per trip (e.g. 6000, 5200, 3200)"])
-    ws_v.append(["zone            -> Same as vehicle_name for dedicated zone. Float for overflow."])
-    ws_v.append(["available       -> TRUE = working today, FALSE = unavailable"])
-    ws_v.append(["max_trips       -> 2 = normal day, 3 = heavy day"])
+    if os.path.exists(FLEET_FILE):
+        fleet = pd.read_excel(FLEET_FILE, sheet_name="Fleet")
+        fleet.columns = fleet.columns.str.strip().str.lower()
+        for _, vehicle in fleet.dropna(subset=["vehicle_name"]).iterrows():
+            name = str(vehicle["vehicle_name"]).strip()
+            if not name or name.startswith("HOW"):
+                continue
+            ws_v.append([
+                name,
+                vehicle.get("vehicle_type", ""),
+                vehicle.get("capacity_kg", ""),
+                True,
+                vehicle.get("max_trips_per_day", config.MAX_TRIPS_NORMAL),
+                vehicle.get("notes", ""),
+            ])
     ws_v.freeze_panes = "A2"
 
-    buf = io.BytesIO()
-    wb.save(buf)
-    buf.seek(0)
-    return buf.getvalue()
-
-
-def build_suggested_vehicles_excel(fleet_df: pd.DataFrame, suggestion: dict) -> bytes:
-    """Vehicles-sheet-shaped Excel, zone column pre-filled from
-    fr.suggest_fleet_assignment()'s output. Only each vehicle's busiest
-    suggested zone goes in the zone cell (today's solver matches one zone
-    per vehicle); any additional suggested zones are listed in notes."""
-    HDR_FILL = PatternFill("solid", fgColor="1F4E79")
-    HDR_FONT = Font(color="FFFFFF", bold=True)
-    wb = openpyxl.Workbook()
-    ws = wb.active
-    ws.title = "Vehicles"
-    headers = ["vehicle_name", "vehicle_type", "capacity_kg",
-               "zone", "available", "max_trips_per_day", "notes"]
-    ws.append(headers)
-    for cell in ws[1]:
-        cell.fill = HDR_FILL; cell.font = HDR_FONT
-        cell.alignment = Alignment(horizontal="center")
-
-    vzmap   = suggestion["vehicle_zone_map"]     # already sorted busiest-first
-    special = suggestion["special_zone_vehicles"]
-    cross_by_zone = {a["zone"]: a for a in suggestion["cross_type_assists"]}
-
-    fl = fleet_df.dropna(subset=["vehicle_name"])
-    fl = fl[fl["vehicle_name"].astype(str).str.len() > 2]
-    fl = fl[~fl["vehicle_name"].astype(str).str.startswith("HOW")]
-
-    for _, row in fl.iterrows():
-        vname = str(row["vehicle_name"]).strip()
-        note  = ""
-        if vname in special:
-            zone_val = vname
-            note = f"Special zone: {special[vname]}"
-        else:
-            zones = vzmap.get(vname, [])   # busiest-first
-            if zones:
-                zone_val = zones[0]        # PRIMARY zone only — real solver affinity today
-                extra = zones[1:]
-                notes_parts = []
-                if extra:
-                    notes_parts.append(f"Also suggested for: {', '.join(extra)} "
-                                       f"(not yet in zone cell — today's solver matches one "
-                                       f"zone per vehicle; combine manually if desired)")
-                if zone_val in cross_by_zone:
-                    notes_parts.append(f"Cross-type suggestion ({cross_by_zone[zone_val]['eligible_pct']:.0f}% "
-                                       f"of zone's customers eligible)")
-                note = " | ".join(notes_parts)
-            else:
-                zone_val = "Float"
-        ws.append([vname, row.get("vehicle_type", ""), row.get("capacity_kg", ""),
-                  zone_val, "TRUE", row.get("max_trips_per_day", ""), note])
-
-    for col_letter, w in zip(["A","B","C","D","E","F","G"], [20,12,14,16,12,18,55]):
-        ws.column_dimensions[col_letter].width = w
-    ws.freeze_panes = "A2"
     buf = io.BytesIO()
     wb.save(buf)
     buf.seek(0)
@@ -167,11 +116,7 @@ def run_routing(file_bytes: bytes, mode: str):
     routes, unassigned, stops_df = rp.solve(stops_df, vehicles_df, zone_affinity=zone_affinity)
     zone_summary = None
     if zone_affinity:
-        vehicle_zones = {}
-        for _, row in vehicles_df.iterrows():
-            z = str(row["zone"]).strip()
-            if z.lower() not in ("", "nan", "float", "none"):
-                vehicle_zones[row["vehicle_name"]] = z
+        vehicle_zones = {route["vehicle_name"]: route["vehicle_zone"] for route in routes}
         original_counts = {}
         for _, row in stops_df.iterrows():
             sz = str(row.get("zone", "")).strip()
@@ -197,38 +142,192 @@ def run_routing_threaded(file_bytes: bytes, mode: str, result_holder: dict):
         result_holder["error"] = str(e)
 
 
-def check_zones_assigned(file_bytes: bytes) -> bool:
-    try:
-        xl  = pd.ExcelFile(io.BytesIO(file_bytes))
-        veh = xl.parse("Vehicles")
-        veh.columns = veh.columns.str.lower().str.strip()
-        veh = veh.dropna(subset=["vehicle_name"])
-        zones = veh["zone"].fillna("").astype(str).str.strip().str.lower()
-        return any(z not in ("", "float", "nan", "none") for z in zones)
-    except Exception:
-        return False
+def render_zone_builder():
+    st.subheader("Build freight zones")
+    st.caption(
+        "Upload historical shipment lines and customer locations. The builder combines "
+        "order lines into one stop per customer per shipment, then proposes stable zones "
+        "using geography, workload patterns, and customer-level vehicle history."
+    )
+    st.download_button(
+        "Download input workbook template",
+        zb.make_input_template(),
+        file_name="zone_builder_input_template.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    )
+
+    uploaded = st.file_uploader(
+        "Upload the completed two-sheet workbook",
+        type=["xlsx"],
+        key="zone_builder_upload",
+        help="Required sheets: DeliveryHistory and Customers. Keep one row per order line.",
+    )
+    target_zone_count = st.number_input(
+        "Target number of zones",
+        min_value=1,
+        max_value=100,
+        value=32,
+        step=1,
+        help="This is a target, not a requirement to match your fleet size. The builder may adjust it to keep vehicle-type groups separate.",
+    )
+
+    if not uploaded:
+        st.info(
+            "DeliveryHistory needs delivery_date, shipment_id, customer_id, vehicle_id, "
+            "vehicle_type, and quantity_kg. Customers needs customer_id, latitude, and longitude."
+        )
+        return
+
+    file_bytes = uploaded.getvalue()
+    digest = hashlib.sha256(file_bytes + str(target_zone_count).encode()).hexdigest()
+    if st.session_state.get("zb_source_digest") != digest:
+        for key in ("zb_updated", "zb_summary", "zb_metadata", "zb_approved"):
+            st.session_state.pop(key, None)
+        st.session_state["zb_source_digest"] = digest
+
+    if st.button("Create zone proposal", type="primary", key="build_zone_proposal"):
+        try:
+            workbook = pd.ExcelFile(io.BytesIO(file_bytes))
+            required_sheets = {"DeliveryHistory", "Customers"}
+            missing = required_sheets - set(workbook.sheet_names)
+            if missing:
+                raise zb.ZoneInputError(
+                    "Workbook is missing sheet(s): " + ", ".join(sorted(missing))
+                )
+            history = workbook.parse("DeliveryHistory")
+            customers = workbook.parse("Customers")
+            with st.spinner("Validating shipment history and creating zones..."):
+                updated, summary, metadata = zb.build_zone_proposal(
+                    history, customers, int(target_zone_count)
+                )
+            st.session_state.update({
+                "zb_updated": updated,
+                "zb_summary": summary,
+                "zb_metadata": metadata,
+                "zb_approved": False,
+            })
+        except zb.ZoneInputError as error:
+            st.error(str(error))
+        except (OSError, ValueError, KeyError) as error:
+            st.error(f"Could not read the uploaded workbook: {error}")
+
+    if "zb_updated" not in st.session_state:
+        return
+
+    updated = st.session_state["zb_updated"]
+    summaries = st.session_state["zb_summary"]
+    metadata = st.session_state["zb_metadata"]
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Customers zoned", f"{metadata['customers']:,}")
+    c2.metric("Freight zones", metadata["created_zone_count"])
+    c3.metric("Historical stops", f"{metadata['stops']:,}")
+    st.caption(
+        f"History: {metadata['history_start']} to {metadata['history_end']} · "
+        f"Observed months: {', '.join(metadata['observed_months'])} · "
+        f"Observed weekdays: {', '.join(metadata['observed_weekdays'])}"
+    )
+    for message in metadata["messages"]:
+        st.warning(message)
+
+    st.markdown("#### Review zone workloads and vehicle evidence")
+    st.caption(
+        "Customer primary type is ranked from both historical stop and kg shares. "
+        "Zone type mix is descriptive, not a hard delivery restriction. Explicit "
+        "allowed_vehicle_types in Customers are preserved as constraints."
+    )
+    summary_df = pd.DataFrame(summaries)
+    visible_columns = [
+        "zone", "customers", "observed_stops", "avg_stops_per_observed_day",
+        "p75_daily_stops", "avg_kg_per_observed_day", "p75_daily_kg",
+        "primary_vehicle_type", "vehicle_type_mix", "vehicle_type_kg_mix", "type_confidence",
+        "busiest_weekday", "busiest_observed_month",
+    ]
+    st.dataframe(
+        summary_df[visible_columns],
+        use_container_width=True,
+        hide_index=True,
+        height=420,
+    )
+    with st.expander("Compare observed weekday and month workload"):
+        pattern_columns = [
+            column for column in summary_df.columns
+            if column.startswith(("avg_Monday_", "avg_Tuesday_", "avg_Wednesday_",
+                                  "avg_Thursday_", "avg_Friday_", "avg_Saturday_",
+                                  "avg_Sunday_", "avg_January_", "avg_February_",
+                                  "avg_March_", "avg_April_", "avg_May_", "avg_June_",
+                                  "avg_July_", "avg_August_", "avg_September_",
+                                  "avg_October_", "avg_November_", "avg_December_"))
+        ]
+        if pattern_columns:
+            st.dataframe(
+                summary_df[["zone"] + pattern_columns],
+                use_container_width=True,
+                hide_index=True,
+            )
+        else:
+            st.info("No repeated weekday or month observations were available.")
+
+    st.markdown("#### Geographic preview")
+    map_data = updated[["latitude", "longitude", "zone"]].rename(
+        columns={"latitude": "lat", "longitude": "lon"}
+    )
+    palette = [
+        "#1A5276", "#1E8449", "#D35400", "#8E44AD", "#C0392B", "#17A589",
+        "#B7950B", "#2980B9", "#27AE60", "#E67E22", "#6C3483", "#E74C3C",
+        "#1ABC9C", "#F39C12", "#5D6D7E", "#A93226", "#117A65", "#CA6F1E",
+    ]
+    zone_colors = {
+        zone: palette[index % len(palette)]
+        for index, zone in enumerate(sorted(map_data["zone"].unique()))
+    }
+    map_data["zone_color"] = map_data["zone"].map(zone_colors)
+    st.map(map_data, color="zone_color", size=12)
+    with st.expander("Review customer-level vehicle history and zone membership"):
+        st.dataframe(
+            updated[[
+                "customer_code", "customer_name", "zone", "preferred_vehicle",
+                "vehicle_type_confidence", "historical_vehicle_types", "vehicle_breakdown",
+                "vehicle_type_workload", "eligible_vehicles",
+            ]],
+            use_container_width=True,
+            hide_index=True,
+            height=360,
+        )
+
+    if not st.session_state.get("zb_approved"):
+        if st.button("Approve and activate these zones", type="primary", key="approve_zone_proposal"):
+            try:
+                os.makedirs(os.path.dirname(config.CUSTOMER_MASTER), exist_ok=True)
+                with open(config.CUSTOMER_MASTER, "wb") as customer_master_file:
+                    customer_master_file.write(
+                        zb.make_zone_workbook(updated, summaries, metadata)
+                    )
+            except OSError as error:
+                st.error(f"Could not activate the approved customer master: {error}")
+            else:
+                st.session_state["zb_approved"] = True
+                st.rerun()
+        st.info("Review the map and workload summary. Approval replaces the active customer master used by route planning.")
+    else:
+        st.success("Approved zones are active in the route planner.")
+        st.download_button(
+            "Download approved customer master",
+            zb.make_zone_workbook(updated, summaries, metadata),
+            file_name="customer_master_with_zones.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            type="primary",
+        )
 
 
 if page == "🗺 Route Planning":
     st.header("Route Planning")
-    col_up, col_mode = st.columns([3, 1])
-    with col_up:
-        uploaded = st.file_uploader(
-            "Upload **today.xlsx** (Orders + Vehicles sheets)",
-            type=["xlsx"],
-            help="Need a blank template? Admin → Fleet & Zones → Download blank template.",
-        )
-    with col_mode:
-        st.markdown("**Mode**")
-        mode_label = st.radio(
-            "mode", ["🧠 SMART", "🔓 FREE"], label_visibility="collapsed",
-            help=(
-                "**SMART** — Zone-aware. Each vehicle biased to its own customers "
-                "but solver can reassign for efficiency. Daily use.\n\n"
-                "**FREE** — No zone bias. Pure distance. Use as benchmark or backup."
-            ),
-        )
-        mode = "smart" if "SMART" in mode_label else "free"
+    st.caption("Upload orders and the vehicles available today. The planner uses the approved freight zones and assigns work to compatible available vehicles.")
+    uploaded = st.file_uploader(
+        "Upload **today.xlsx** (Orders + Vehicles sheets)",
+        type=["xlsx"],
+        help="Need a blank template? Admin → Fleet Registry → Download blank template.",
+    )
+    mode = "smart"
 
     if uploaded:
         file_bytes = uploaded.getvalue()
@@ -237,15 +336,10 @@ if page == "🗺 Route Planning":
             st.caption(f"📦 **{len(prev)}** orders detected")
         except Exception:
             pass
-        if mode == "smart" and not check_zones_assigned(file_bytes):
-            st.warning("⚠️ No zone assignments found in Vehicles sheet. "
-                       "Switch to FREE mode or set zones in the Vehicles sheet.")
-
         if st.button("▶  Generate Routes", type="primary"):
             max_sec   = config.SOLVER_TIME_LIMIT_SECONDS
-            mode_name = "SMART" if mode == "smart" else "FREE"
 
-            st.markdown(f"**Running {mode_name} routing...**")
+            st.markdown("**Assigning vehicles and optimizing routes...**")
             progress_bar  = st.progress(0)
             status_text   = st.empty()
 
@@ -425,7 +519,7 @@ elif page == "⚙️ Admin":
                     lat=st.number_input("Latitude *", value=42.005, format="%.6f", step=0.0001)
                     lon=st.number_input("Longitude *", value=21.435, format="%.6f", step=0.0001)
                 with col2:
-                    zone=st.selectbox("Zone (= vehicle name) *", zones_list)
+                    zone=st.selectbox("Freight Zone *", zones_list)
                     pref=st.selectbox("Preferred Vehicle", ["Kamion","Furgon","Van"])
                     eligible=st.multiselect("Eligible Vehicles *", ["Kamion","Furgon","Van"], default=[pref])
                     tw_s=st.text_input("TW Start","06:00"); tw_e=st.text_input("TW End","18:00")
@@ -447,320 +541,13 @@ elif page == "⚙️ Admin":
                         wb_m.save(mp2)
                         st.success(f"✅ {name} ({code}) added to zone {zone}.")
 
-    with tab_fleet:
-        st.subheader("Fleet & Zones")
-        st.markdown("#### Blank today.xlsx Template")
-        st.markdown("Download, fill in your vehicles once, then use daily.")
-        st.download_button("⬇  Download blank today.xlsx",
-                           make_blank_template(), file_name="today.xlsx",
-                           mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                           type="primary")
-        st.markdown("---")
-        st.markdown("""**Vehicles sheet columns:**
-
-| Column | Description |
-|---|---|
-| `vehicle_name` | Name/plate — e.g. `DSD 1`, `F 3`, `Van 7` |
-| `vehicle_type` | `Kamion`, `Furgon`, or `Van` |
-| `capacity_kg` | Usable load per trip in kg |
-| `zone` | Same as `vehicle_name` for dedicated zone. `Float` for overflow. |
-| `available` | `TRUE` = working today |
-| `max_trips_per_day` | `2` normal, `3` heavy |
-""")
-        if os.path.exists(config.CUSTOMER_MASTER):
-            try:
-                xl = pd.ExcelFile(config.CUSTOMER_MASTER)
-                if "Zone Summary" in xl.sheet_names:
-                    mdf3 = xl.parse("Zone Summary")
-                    st.markdown("**Zone Summary from Customer Master**")
-                    st.dataframe(mdf3, use_container_width=True, hide_index=True, height=260)
-                elif "Customers" in xl.sheet_names:
-                    mdf3 = xl.parse("Customers")
-                    if "zone" in mdf3.columns:
-                        zsum = mdf3.groupby("zone").size().reset_index(name="customers")
-                        st.markdown("**Zone Summary (from Customers sheet)**")
-                        st.dataframe(zsum, use_container_width=True, hide_index=True, height=260)
-            except Exception as e:
-                st.warning(f"Could not load zone summary: {e}")
-
     with tab_zonebuilder:
-        st.subheader("Zone Builder")
-        st.markdown(
-            "Upload historical delivery data and your fleet is read from the Fleet Registry. "
-            "The model will automatically assign each customer to a geographically compact, "
-            "workload-balanced zone named after your vehicles."
-        )
-        st.markdown("---")
-
-        # Fleet status
-        fleet_ok = os.path.exists(FLEET_FILE)
-        if fleet_ok:
-            try:
-                fl_df = pd.read_excel(FLEET_FILE, sheet_name="Fleet")
-                fl_df = fl_df.dropna(subset=["vehicle_name"])
-                fl_df = fl_df[fl_df["vehicle_name"].astype(str).str.len() > 2]
-                fl_df = fl_df[~fl_df["vehicle_name"].astype(str).str.startswith("HOW")]
-                k = (fl_df["vehicle_type"]=="Kamion").sum()
-                f = (fl_df["vehicle_type"]=="Furgon").sum()
-                v = (fl_df["vehicle_type"]=="Van").sum()
-                st.success(f"✅ Fleet Registry loaded: {k} Kamion · {f} Furgon · {v} Van ({len(fl_df)} total)")
-            except Exception as e:
-                fleet_ok = False
-                st.warning(f"Could not read fleet.xlsx: {e}")
-        else:
-            st.warning("No fleet.xlsx found. Go to the Fleet Registry tab to define your fleet first.")
-
-        # Zone mode selector
-        st.markdown("**Zone Building Mode**")
-        zb_mode = st.radio(
-            "zb_mode",
-            ["🚛 Fleet-matched (zones = vehicles)", "🔍 Auto-optimal (natural zones)"],
-            label_visibility="collapsed",
-            help=(
-                "**Fleet-matched** — creates exactly as many zones as vehicles in your fleet. "
-                "Each vehicle gets a dedicated zone.\n\n"
-                "**Auto-optimal** — uses silhouette analysis to find the natural geographic "
-                "zone count. Zones named Kamion_01, Furgon_03 etc. Vehicles not assigned "
-                "to a natural zone become Float (overflow). Produces more compact routes."
-            )
-        )
-        build_mode = "auto" if "Auto" in zb_mode else "fleet"
-
-        # History upload
-        hist_file = st.file_uploader(
-            "Upload historical delivery file",
-            type=["xlsx"],
-            help="Required columns: Delivery Date, Customer Code, Customer Name, "
-                 "Latitude, Longitude, Total Weight, Vehicle Type"
-        )
-
-        master_file = st.file_uploader(
-            "Upload existing customer master (optional — used to preserve non-zone data)",
-            type=["xlsx"], key="zb_master"
-        )
-
-        if hist_file and fleet_ok:
-            if st.button("🗺  Build Zones", type="primary"):
-                spinner_msg = ("Finding natural zones + clustering... (60–90s)"
-                               if build_mode == "auto"
-                               else "Clustering customers into zones... (30–60s)")
-                with st.spinner(spinner_msg):
-                    try:
-                        hist_df   = pd.read_excel(io.BytesIO(hist_file.getvalue()))
-                        master_df = None
-                        if master_file:
-                            try:
-                                master_df = pd.read_excel(
-                                    io.BytesIO(master_file.getvalue()),
-                                    sheet_name="Customers"
-                                )
-                            except Exception:
-                                pass
-
-                        updated, zone_summary, map_html, quality, fleet_rec = fr.build_zones(
-                            hist_df, fl_df, master_df, mode=build_mode
-                        )
-                        st.session_state.update({
-                            "zb_updated":    updated,
-                            "zb_summary":    zone_summary,
-                            "zb_map":        map_html,
-                            "zb_quality":    quality,
-                            "zb_fleet_rec":  fleet_rec,
-                            "zb_mode":       build_mode,
-                            "zb_fleet_df":   fl_df,
-                        })
-                        st.session_state.pop("zb_suggestion", None)
-                    except Exception as e:
-                        st.error(f"Zone building failed: {e}")
-
-        if "zb_updated" in st.session_state:
-            updated      = st.session_state["zb_updated"]
-            zone_summary = st.session_state["zb_summary"]
-            map_html     = st.session_state["zb_map"]
-            fleet_rec    = st.session_state.get("zb_fleet_rec")
-            run_mode     = st.session_state.get("zb_mode", "fleet")
-
-            st.markdown("---")
-            st.success(f"✅ Zones built for **{len(updated):,}** customers across **{len(zone_summary)}** zones.")
-            zone_type_counts = pd.Series([z["vehicle_type"] for z in zone_summary]).value_counts()
-            st.caption(" | ".join(f"**{vt}**: {zone_type_counts.get(vt, 0)} zones"
-                                  for vt in ["Kamion", "Furgon", "Van"]))
-
-            # Auto mode: show fleet recommendation
-            if run_mode == "auto" and fleet_rec:
-                st.markdown("#### Fleet Recommendation")
-                st.caption("Zones are sized from geography/workload/customer-count targets, independent of fleet size. "
-                           "Zones without a dedicated vehicle are served dynamically by Float vehicles.")
-                rc1, rc2, rc3 = st.columns(3)
-                for col, vtype in zip([rc1, rc2, rc3], ["Kamion", "Furgon", "Van"]):
-                    rec = fleet_rec.get(vtype, {})
-                    unclaimed, spare = rec.get("unclaimed_zones", 0), rec.get("spare_float", 0)
-                    col.metric(
-                        vtype,
-                        f"{rec.get('n_zones', '?')} zones",
-                        delta=(f"{unclaimed} unclaimed" if unclaimed > 0
-                               else (f"{spare} spare Float" if spare > 0 else "Fully covered")),
-                        delta_color="off",
-                        help=f"Fleet available: {rec.get('fleet_available','?')}  |  "
-                             f"Dedicated: {rec.get('dedicated_zones','?')}  |  "
-                             f"Workload needs: {rec.get('workload_min_zones','?')} zones  |  "
-                             f"Customer-count needs: {rec.get('customer_min_zones','?')} zones  |  "
-                             f"Avg zone radius: {rec.get('achieved_radius_km') if rec.get('achieved_radius_km') is not None else '?'} km"
-                    )
-                coverage_msgs = [rec["coverage_msg"] for rec in fleet_rec.values() if rec.get("coverage_msg")]
-                if coverage_msgs:
-                    st.info("**Zone / fleet coverage:**\n\n" +
-                            "\n\n".join(f"- {m}" for m in coverage_msgs))
-
-                # Suggested vehicle assignment
-                st.markdown("#### Suggested Vehicle Assignment")
-                st.caption(
-                    "Greedy nearest-neighbour suggestion for which vehicle should cover each "
-                    "unclaimed zone (a vehicle can cover multiple zones). Cross-type assists (⚡) "
-                    "are only offered when enough of the zone's customers are eligible for that "
-                    "vehicle type."
-                )
-                if st.button("🚚 Suggest Vehicle Assignments"):
-                    with st.spinner("Assigning zones to vehicles..."):
-                        try:
-                            suggestion = fr.suggest_fleet_assignment(
-                                updated, zone_summary, st.session_state["zb_fleet_df"],
-                                cross_type=True,
-                            )
-                            st.session_state["zb_suggestion"] = suggestion
-                        except Exception as e:
-                            st.error(f"Suggestion failed: {e}")
-
-                if "zb_suggestion" in st.session_state:
-                    sug = st.session_state["zb_suggestion"]
-                    n_total     = len(sug["zone_vehicle_map"])
-                    n_unclaimed = len(sug["unclaimed_zones"])
-                    n_cross     = len(sug["cross_type_assists"])
-                    sc1, sc2, sc3 = st.columns(3)
-                    sc1.metric("Zones suggested", f"{n_total - n_unclaimed}/{n_total}" if n_total else "0/0")
-                    sc2.metric("Cross-type assists", n_cross)
-                    sc3.metric("Still unclaimed", n_unclaimed)
-
-                    if sug["cross_type_assists"]:
-                        st.markdown("**Cross-Type Assignments (review closely)**")
-                        df_cross = pd.DataFrame(sug["cross_type_assists"])[
-                            ["zone", "home_type", "vehicle", "vehicle_type", "eligible_pct", "distance_km"]
-                        ]
-                        df_cross.columns = ["Zone", "Home Type", "Vehicle", "Assigned Type",
-                                             "Customer Eligible %", "Distance (km)"]
-                        st.dataframe(df_cross, use_container_width=True, hide_index=True)
-
-                    st.caption(
-                        "Vehicles suggested for multiple zones list only their busiest zone in "
-                        "the download's `zone` cell (so it gets real solver zone-affinity today); "
-                        "additional suggested zones are listed in `notes` for manual follow-up."
-                    )
-                    st.download_button(
-                        "⬇  Download suggested Vehicles sheet (today.xlsx-ready)",
-                        build_suggested_vehicles_excel(st.session_state["zb_fleet_df"], sug),
-                        file_name="today_vehicles_suggested.xlsx",
-                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                    )
-
-            # Quality score
-            q = st.session_state.get("zb_quality", {})
-            if q:
-                qc1, qc2, qc3, qc4 = st.columns(4)
-                qc1.metric("🏆 Composite Score", f"{q.get('composite_score',0)}/100",
-                           help="Overall zone quality: balance + compactness")
-                qc2.metric("⚖️ Stop Balance", f"{q.get('stop_score',0)}/100",
-                           help=f"CV={q.get('stop_balance_cv',0):.3f} — lower CV = more equal daily stops")
-                qc3.metric("📦 Weight Balance", f"{q.get('weight_score',0)}/100",
-                           help=f"CV={q.get('weight_balance_cv',0):.3f} — lower CV = more equal daily weight")
-                qc4.metric("📍 Compactness", f"{q.get('compactness_score',0)}/100",
-                           help=f"Avg {q.get('avg_compactness_km',0):.1f} km intra-zone radius")
-
-            # Download updated master
-            buf = io.BytesIO()
-            import openpyxl as _opx
-            wb_out = _opx.Workbook()
-            ws_out = wb_out.active
-            ws_out.title = "Customers"
-            cols_out = list(updated.columns)
-            ws_out.append(cols_out)
-            for _, row in updated.iterrows():
-                ws_out.append([row[c] for c in cols_out])
-            wb_out.save(buf)
-            buf.seek(0)
-            st.download_button(
-                "⬇  Download updated customer_master.xlsx",
-                buf.getvalue(),
-                file_name="customer_master.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                type="primary",
-            )
-
-            # Validation table
-            st.markdown("#### Zone Validation Summary")
-            st.caption("Avg = mean day stops · P75 = busy day stops (1-in-4) · Utilisation based on P75 demand")
-            st.caption("✅ OK  🟡 Heavy on busy days (>70%)  ⚠️ Overloaded on busy days (>90%)  💤 Very light")
-            df_raw = pd.DataFrame(zone_summary)
-            sug = st.session_state.get("zb_suggestion")
-            if sug:
-                zvm = sug["zone_vehicle_map"]
-                cross_zones = {a["zone"] for a in sug["cross_type_assists"]}
-                def _fmt_suggestion(zone_name):
-                    v = zvm.get(zone_name)
-                    if v:
-                        return f"{v} ⚡" if zone_name in cross_zones else v
-                    if zone_name in sug["unclaimed_zones"]:
-                        return "⚠️ none found"
-                    return "— already dedicated —"
-                df_raw["suggested_vehicle"] = df_raw["zone"].apply(_fmt_suggestion)
-            # Build column list defensively — p75 columns may be absent in old results
-            has_p75 = "p75_daily_stops" in df_raw.columns
-            base_cols  = ["zone","vehicle_type","customers","exp_daily_stops","exp_daily_kg",
-                          "trip_capacity_kg","utilisation_pct","flag"]
-            base_names = ["Zone","Type","Customers","Avg Stops/Day","Avg KG/Day",
-                          "Trip Cap (kg)","Utilisation %","Status"]
-            if has_p75:
-                sel_cols  = ["zone","vehicle_type","customers","exp_daily_stops",
-                             "p75_daily_stops","exp_daily_kg","trip_capacity_kg",
-                             "utilisation_pct","flag"]
-                sel_names = ["Zone","Type","Customers","Avg Stops/Day","P75 Stops/Day",
-                             "Avg KG/Day","Trip Cap (kg)","P75 Utilisation %","Status"]
-            else:
-                sel_cols, sel_names = base_cols, base_names
-            if sug:
-                sel_cols  = sel_cols  + ["suggested_vehicle"]
-                sel_names = sel_names + ["Suggested Vehicle"]
-            df_sum = df_raw[[c for c in sel_cols if c in df_raw.columns]].copy()
-            df_sum.columns = sel_names[:len(df_sum.columns)]
-
-            def _zb_color(row):
-                if "OVER" in str(row["Status"]):
-                    return ["background-color:#fdd"]*len(row)
-                if "Heavy" in str(row["Status"]):
-                    return ["background-color:#fff9c4"]*len(row)
-                if "light" in str(row["Status"]):
-                    return ["background-color:#d4eaf7"]*len(row)
-                return [""]*len(row)
-
-            st.dataframe(
-                df_sum.style.apply(_zb_color, axis=1),
-                use_container_width=True, hide_index=True, height=400
-            )
-
-            # Interactive map
-            st.markdown("#### Interactive Zone Map")
-            st.caption("Filter by vehicle type or zone in the map sidebar. Summary table is shown below the map.")
-            components.html(map_html, height=600, scrolling=False)
-
-            if st.button("🗑  Clear Results"):
-                for k in ["zb_updated","zb_summary","zb_map","zb_suggestion","zb_fleet_df"]:
-                    st.session_state.pop(k, None)
-                st.rerun()
+        render_zone_builder()
 
     with tab_fleet:
         st.subheader("Fleet Registry")
         st.markdown(
-            "Define your fleet here once. This is the source of truth used by the Zone Builder "
-            "and for generating the `today.xlsx` template."
+            "Define your fleet once. Use the `available` column in today's workbook to select which vehicles are working."
         )
 
         col_up, col_dn = st.columns(2)

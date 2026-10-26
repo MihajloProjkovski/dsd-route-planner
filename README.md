@@ -14,7 +14,7 @@ The first launch opens the local Streamlit interface in a browser.
 
 ## Create freight zones
 
-Open **Admin → Zone Builder** and download the input workbook template. Fill
+Open **Zone Builder** from the main navigation and download the input workbook template. Fill
 these two sheets:
 
 ### `DeliveryHistory` — one row per order line

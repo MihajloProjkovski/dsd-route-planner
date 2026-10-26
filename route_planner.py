@@ -90,7 +90,7 @@ def load_orders(today_path, master_path):
     if not os.path.exists(master_path):
         sys.exit(
             f"\nERROR: '{master_path}' not found.\n"
-            "  Build and activate a customer master in Admin > Zone Builder."
+            "  Build and activate a customer master in Zone Builder."
         )
 
     xl     = pd.ExcelFile(today_path)

@@ -55,7 +55,7 @@ SPECIAL_ZONE_POLYGONS = {
 
 def load_customers(master_path):
     if not os.path.exists(master_path):
-        sys.exit(f"ERROR: {master_path} not found. Build zones in Admin > Zone Builder first.")
+        sys.exit(f"ERROR: {master_path} not found. Build zones in Zone Builder first.")
 
     df = pd.read_excel(master_path, sheet_name="Customers")
     df.columns = df.columns.str.strip().str.lower().str.replace(" ", "_")

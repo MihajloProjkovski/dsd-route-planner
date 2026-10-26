@@ -54,7 +54,7 @@ st.sidebar.caption(f"📅 {date.today().strftime('%A, %d %b %Y')}")
 st.sidebar.markdown("---")
 page = st.sidebar.radio(
     "Navigate",
-    ["🗺 Route Planning", "⚙️ Admin"],
+    ["🗺 Route Planning", "🗺 Zone Builder", "⚙️ Admin"],
     label_visibility="collapsed",
 )
 st.sidebar.markdown("---")
@@ -319,7 +319,11 @@ def render_zone_builder():
         )
 
 
-if page == "🗺 Route Planning":
+if page == "🗺 Zone Builder":
+    st.header("Zone Builder")
+    render_zone_builder()
+
+elif page == "🗺 Route Planning":
     st.header("Route Planning")
     st.caption("Upload orders and the vehicles available today. The planner uses the approved freight zones and assigns work to compatible available vehicles.")
     uploaded = st.file_uploader(
@@ -459,9 +463,9 @@ elif page == "⚙️ Admin":
         st.rerun()
     st.markdown("---")
 
-    tab_master, tab_customer, tab_fleet, tab_zonebuilder, tab_cfg = st.tabs([
+    tab_master, tab_customer, tab_fleet, tab_cfg = st.tabs([
         "📋 Customer Master", "➕ New Customer", "🚛 Fleet Registry",
-        "🗺 Zone Builder", "⚙️ Configuration"])
+        "⚙️ Configuration"])
 
     with tab_master:
         st.subheader("Customer Master")
@@ -540,9 +544,6 @@ elif page == "⚙️ Admin":
                         ws_m.append([nrow.get(c,"") for c in cols])
                         wb_m.save(mp2)
                         st.success(f"✅ {name} ({code}) added to zone {zone}.")
-
-    with tab_zonebuilder:
-        render_zone_builder()
 
     with tab_fleet:
         st.subheader("Fleet Registry")
